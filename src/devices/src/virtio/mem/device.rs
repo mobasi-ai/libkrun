@@ -457,6 +457,13 @@ impl Mem {
         if committed.is_null() {
             return Err(io::Error::last_os_error());
         }
+        // Commit first, so that Windows can grow a page file that it manages, then keep a
+        // reserve: a VMM whose own allocations fail aborts and takes the guest with it.
+        if let Err(error) = windows_commit_headroom() {
+            // SAFETY: the range was committed above and is not mapped into the partition.
+            unsafe { VirtualFree(host.cast(), len as usize, MEM_DECOMMIT) };
+            return Err(error);
+        }
         if let Err(error) = self.vmm_request("map plugged RAM", |reply| {
             WorkerMessage::RamMap(reply, host as u64, guest_addr, len)
         }) {
@@ -591,6 +598,62 @@ impl Mem {
 
         have_used
     }
+}
+
+/// Commit that the VMM process keeps free for its own allocations after a plug.
+#[cfg(target_os = "windows")]
+const WINDOWS_COMMIT_RESERVE: u64 = 512 << 20;
+
+/// Fail when less than [`WINDOWS_COMMIT_RESERVE`] of commit is left, for the whole system (RAM
+/// plus page file) or under the per-process memory limit of the job that holds this process.
+#[cfg(target_os = "windows")]
+fn windows_commit_headroom() -> io::Result<()> {
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is sized and its length field is set, as the call requires.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullAvailPageFile < WINDOWS_COMMIT_RESERVE {
+        return Err(io::Error::other(format!(
+            "only {} MiB of system commit would be left",
+            status.ullAvailPageFile >> 20
+        )));
+    }
+
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a null job handle asks for the job of this process; the buffer has the size given.
+    let in_job = unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    if in_job && limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0 {
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        // SAFETY: `counters` is sized and its size field is set, as the call requires.
+        let ok = unsafe {
+            GetProcessMemoryInfo(GetCurrentProcess(), (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(), counters.cb)
+        } != 0;
+        let limit = limits.ProcessMemoryLimit as u64;
+        let used = counters.PrivateUsage as u64;
+        if ok && limit.saturating_sub(used) < WINDOWS_COMMIT_RESERVE {
+            return Err(io::Error::other(format!(
+                "only {} MiB would be left under the job memory limit",
+                limit.saturating_sub(used) >> 20
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn resp(resp_type: u16, state: u16) -> VirtioMemResp {
