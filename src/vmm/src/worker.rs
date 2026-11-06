@@ -46,6 +46,10 @@ impl super::Vmm {
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            WorkerMessage::RamMap(s, h, g, l) => self.map_ram(s, h, g, l),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            WorkerMessage::RamUnmap(s, g, l) => self.remove_mapping(s, g, l),
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             WorkerMessage::GsiRoute(sender, entries) => {
                 let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();

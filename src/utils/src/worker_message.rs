@@ -21,4 +21,10 @@ pub enum WorkerMessage {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     GpuRemoveMapping(crossbeam_channel::Sender<bool>, u64, u64),
     ConvertMemory(crossbeam_channel::Sender<bool>, MemoryProperties),
+    /// Map plugged virtio-mem RAM (read, write, execute) at a guest address.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    RamMap(crossbeam_channel::Sender<bool>, u64, u64, u64),
+    /// Unmap virtio-mem RAM before the host releases its backing.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    RamUnmap(crossbeam_channel::Sender<bool>, u64, u64),
 }

@@ -1941,7 +1941,14 @@ pub fn build_microvm_paused(
     }
     #[cfg(not(feature = "tee"))]
     if let Some(mem_device) = vm_resources.mem_device.clone() {
-        attach_mem_device(&mut vmm, event_manager, intc.clone(), mem_device)?;
+        attach_mem_device(
+            &mut vmm,
+            event_manager,
+            intc.clone(),
+            mem_device,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            _sender.clone(),
+        )?;
         trace.mark("mem.attached");
     }
     #[cfg(not(feature = "tee"))]
@@ -2975,6 +2982,8 @@ fn create_guest_memory_with_placement(
     // backing is anonymous and lazily faulted, so unplugged capacity costs no
     // host memory; the region is deliberately absent from the FDT/MPTABLE
     // memory nodes — the guest discovers it through the virtio-mem device.
+    #[cfg(all(target_os = "windows", not(feature = "tee")))]
+    let mut hotplug_region: Option<GuestAddress> = None;
     #[cfg(not(feature = "tee"))]
     if let Some(mem_device) = &vm_resources.mem_device {
         let boot_mib = vm_resources.vm_config().mem_size_mib.unwrap_or(128) as u64;
@@ -2995,6 +3004,10 @@ fn create_guest_memory_with_placement(
                 .expect("hotplug region is block-aligned by construction");
             arch_mem_regions.push((GuestAddress(base), hotplug_bytes as usize));
             numa_managed_regions.push(true);
+            #[cfg(target_os = "windows")]
+            {
+                hotplug_region = Some(GuestAddress(base));
+            }
         }
     }
 
@@ -3002,11 +3015,17 @@ fn create_guest_memory_with_placement(
     let (guest_mem, mut memory_placement) = if let Some(topology) = &vm_resources.numa_topology {
         create_numa_guest_memory(&arch_mem_regions, &numa_managed_regions, topology)?
     } else {
-        (
+        #[cfg(target_os = "windows")]
+        let guest_mem = if hotplug_region.is_some() {
+            windows_guest_memory_with_reserved_hotplug(&arch_mem_regions, hotplug_region)?
+        } else {
             GuestMemoryMmap::from_ranges(&arch_mem_regions)
-                .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?,
-            MemoryPlacementState::inherited(),
-        )
+                .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?
+        };
+        #[cfg(not(target_os = "windows"))]
+        let guest_mem = GuestMemoryMmap::from_ranges(&arch_mem_regions)
+            .map_err(StartMicrovmError::GuestMemoryMmapFromRanges)?;
+        (guest_mem, MemoryPlacementState::inherited())
     };
     #[cfg(feature = "tee")]
     let (guest_mem, memory_placement) = (
@@ -4711,13 +4730,44 @@ fn attach_generation_device(
 }
 
 #[cfg(not(feature = "tee"))]
+/// Guest memory for Windows where the virtio-mem hotplug region is only reserved.
+///
+/// Windows charges committed memory against the commit limit (RAM plus page file) at once,
+/// touched or not. A hotplug region committed at boot would cost its whole capacity and fail
+/// with error 1455 when the limit is short. The device commits and maps each block when the
+/// guest plugs it, and decommits it on unplug.
+#[cfg(all(target_os = "windows", not(feature = "tee")))]
+fn windows_guest_memory_with_reserved_hotplug(
+    regions: &[(GuestAddress, usize)],
+    hotplug: Option<GuestAddress>,
+) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
+    use vm_memory::{GuestRegionMmap, MmapRegion};
+    let mut built = Vec::with_capacity(regions.len());
+    for (start, size) in regions {
+        let mapping = if Some(*start) == hotplug {
+            MmapRegion::new_reserved(*size)
+        } else {
+            MmapRegion::new(*size)
+        }
+        .map_err(|error| {
+            StartMicrovmError::GuestMemoryMmapFromRanges(vm_memory::mmap::FromRangesError::MmapRegion(error))
+        })?;
+        built.push(GuestRegionMmap::new(mapping, *start).ok_or(StartMicrovmError::GuestMemoryRegion)?);
+    }
+    GuestMemoryMmap::from_regions(built).map_err(StartMicrovmError::GuestMemoryRegionCollection)
+}
+
 fn attach_mem_device(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
     intc: IrqChip,
     mem_device: Arc<Mutex<devices::virtio::Mem>>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    mem_device.lock().unwrap().set_map_sender(map_sender);
 
     event_manager
         .add_subscriber(mem_device.clone())

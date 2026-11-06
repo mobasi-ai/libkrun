@@ -1039,6 +1039,12 @@ impl Vm {
             let host_addr = guest_mem
                 .get_host_address(region.start_addr())
                 .map_err(Error::GuestMemoryHostAddress)?;
+            // A virtio-mem hotplug region is only reserved at boot, so that it costs no commit.
+            // The device commits and maps each block when the guest plugs it.
+            if is_reserved_only(host_addr.cast_const()) {
+                debug!("WHP: guest_addr=0x{guest_addr:x} size=0x{size:x} is reserved; mapped on plug");
+                continue;
+            }
 
             map_gpa_range(
                 self.partition.handle,
@@ -1373,6 +1379,19 @@ impl Vm {
         } else {
             reply_sender.send(true).unwrap();
         }
+    }
+
+    /// Map hot-plugged guest RAM with the flags of boot RAM. The host range must be committed.
+    pub fn map_ram(&self, reply_sender: Sender<bool>, host_addr: u64, guest_addr: u64, len: u64) {
+        debug!("map_ram: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        let ok = match map_gpa_range(self.partition.handle, host_addr as *const u8, guest_addr, len) {
+            Ok(()) => true,
+            Err(err) => {
+                error!("{err}");
+                false
+            }
+        };
+        reply_sender.send(ok).unwrap();
     }
 
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
@@ -2409,6 +2428,17 @@ fn bitmap_to_ranges(
             _ => {}
         }
     }
+}
+
+/// True when the first page at `addr` is reserved but not committed.
+fn is_reserved_only(addr: *const u8) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_RESERVE};
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a valid out buffer of the size that the call is given.
+    let written = unsafe {
+        VirtualQuery(addr.cast(), &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>())
+    };
+    written != 0 && info.State == MEM_RESERVE
 }
 
 fn unmap_gpa_range(partition: WHV_PARTITION_HANDLE, guest_addr: u64, size: u64) -> Result<()> {
