@@ -2951,6 +2951,12 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         }
     };
 
+    // virtio-mem on macOS and Windows asks the worker to map and unmap hot-plugged RAM.
+    #[cfg(all(not(feature = "tee"), any(target_os = "macos", target_os = "windows")))]
+    if ctx_cfg.vmr.mem_device.is_some() {
+        vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     if ctx_cfg.gpu_virgl_flags.is_some() {
         vmm::worker::start_worker_thread(_vmm.clone(), _receiver).unwrap();
