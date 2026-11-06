@@ -31,6 +31,9 @@ const VIRTIO_MEM_REQ_STATE: u16 = 3;
 // Response types.
 const VIRTIO_MEM_RESP_ACK: u16 = 0;
 const VIRTIO_MEM_RESP_NACK: u16 = 1;
+// "Cannot process the request now": the Linux driver retries later with a growing
+// delay (5 s, doubling to 5 min), where NACK makes it retry at once.
+const VIRTIO_MEM_RESP_BUSY: u16 = 2;
 const VIRTIO_MEM_RESP_ERROR: u16 = 3;
 
 // STATE response payloads.
@@ -302,11 +305,11 @@ impl Mem {
             return resp(VIRTIO_MEM_RESP_NACK, 0);
         }
         // Give the block host memory before the guest may use it. A host that cannot commit the
-        // memory now (Windows error 1455) refuses the plug; the guest keeps its current size and
-        // asks again later.
+        // memory now (Windows error 1455, or too little headroom) answers BUSY; the guest keeps
+        // its current size and asks again after a delay.
         if let Err(error) = self.back_range(addr, add) {
             warn!("virtio-mem: cannot back {add} plugged bytes at 0x{addr:x}: {error}");
-            return resp(VIRTIO_MEM_RESP_NACK, 0);
+            return resp(VIRTIO_MEM_RESP_BUSY, 0);
         }
         // Ownership transitions are changes even if the guest has not written the newly plugged
         // pages. Mark before publishing the bitmap so incremental capture cannot inherit stale RAM.
