@@ -6,11 +6,15 @@ members = [
     "examples/rust_vm",
 ]
 default-members = ["src/libkrun", "src/krun_input", "src/krun", "examples/rust_vm"]
-exclude = ["examples/gtk_display"]
+exclude = ["examples/gtk_display", "third_party/msb-vm-memory"]
 resolver = "2"
 
 # Keep every vm-memory consumer, including msb-imago, on msb-vm-memory. Cargo treats the upstream
 # and compatibility packages as different type identities even though they expose the same API.
+[patch.crates-io]
+# Mobasi: the vendored copy adds a reserve-only Windows region for virtio-mem.
+msb-vm-memory = { path = "third_party/msb-vm-memory" }
+
 [profile.dev]
 #panic = "abort"
 

@@ -148,13 +148,14 @@ impl Balloon {
 
 #[cfg(unix)]
 fn discard_guest_pages(host_addr: *mut u8, len: u32) -> std::io::Result<()> {
-    let ret = unsafe {
-        libc::madvise(
-            host_addr as *mut libc::c_void,
-            len as usize,
-            libc::MADV_DONTNEED,
-        )
-    };
+    // macOS keeps MADV_DONTNEED pages in the process footprint, so a reported free page
+    // would never go back to the host. MADV_FREE_REUSABLE releases it at once; the guest
+    // makes no promise about the contents of a page that it reported as free.
+    #[cfg(target_os = "macos")]
+    let advice = libc::MADV_FREE_REUSABLE;
+    #[cfg(not(target_os = "macos"))]
+    let advice = libc::MADV_DONTNEED;
+    let ret = unsafe { libc::madvise(host_addr as *mut libc::c_void, len as usize, advice) };
     if ret < 0 {
         Err(std::io::Error::last_os_error())
     } else {

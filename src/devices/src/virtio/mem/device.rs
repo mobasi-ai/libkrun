@@ -2,6 +2,8 @@ use std::cmp;
 use std::io::{self, Write};
 
 use utils::eventfd::EventFd;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use utils::worker_message::WorkerMessage;
 #[cfg(target_os = "linux")]
 use vm_memory::{Address, GuestMemoryRegion};
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -105,6 +107,10 @@ pub struct Mem {
     config: VirtioMemConfig,
     /// One bit per block; set = plugged.
     plugged_blocks: Vec<bool>,
+    /// Asks the VMM to map or unmap guest RAM in the hypervisor. On macOS and Windows the
+    /// host backing of a block is released only after the block is unmapped.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    map_sender: Option<crossbeam_channel::Sender<WorkerMessage>>,
 }
 
 impl Mem {
@@ -123,7 +129,15 @@ impl Mem {
                 ..Default::default()
             },
             plugged_blocks: Vec::new(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            map_sender: None,
         })
+    }
+
+    /// Give the device the channel to the VMM worker for RAM map and unmap requests.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn set_map_sender(&mut self, sender: crossbeam_channel::Sender<WorkerMessage>) {
+        self.map_sender = Some(sender);
     }
 
     pub fn id(&self) -> &str {
@@ -287,10 +301,20 @@ impl Mem {
         {
             return resp(VIRTIO_MEM_RESP_NACK, 0);
         }
+        // Give the block host memory before the guest may use it. A host that cannot commit the
+        // memory now (Windows error 1455) refuses the plug; the guest keeps its current size and
+        // asks again later.
+        if let Err(error) = self.back_range(addr, add) {
+            warn!("virtio-mem: cannot back {add} plugged bytes at 0x{addr:x}: {error}");
+            return resp(VIRTIO_MEM_RESP_NACK, 0);
+        }
         // Ownership transitions are changes even if the guest has not written the newly plugged
         // pages. Mark before publishing the bitmap so incremental capture cannot inherit stale RAM.
         if let Err(error) = self.mark_transition(addr, add) {
             error!("virtio-mem: cannot track plug: {error}");
+            if let Err(error) = self.release_backing(addr, add) {
+                error!("virtio-mem: cannot release the backing of a refused plug: {error}");
+            }
             return resp(VIRTIO_MEM_RESP_ERROR, 0);
         }
         for block in &mut self.plugged_blocks[range] {
@@ -370,13 +394,139 @@ impl Mem {
         Ok(())
     }
 
-    /// Guarantee zero-on-reuse while keeping registered mappings and private backing intact.
+    /// Guarantee zero-on-reuse and give the host memory of an unplugged range back.
+    ///
+    /// Linux drops the pages (`MADV_DONTNEED`), which also zeroes them. macOS and Windows
+    /// first unmap the range from the hypervisor, then release it: macOS replaces it with
+    /// fresh anonymous pages and maps it again; Windows decommits it, which also returns
+    /// its commit, and maps it again only on the next plug.
     fn discard_range(&self, guest_addr: u64, len: u64) -> io::Result<()> {
-        let DeviceState::Activated(ref memory, _) = self.device_state else {
-            return Err(io::Error::other("virtio-mem device is inactive"));
-        };
         self.mark_transition(guest_addr, len)?;
-        zero_guest_range(memory, guest_addr, len)
+        self.release_backing(guest_addr, len)
+    }
+
+    fn guest_memory(&self) -> io::Result<&GuestMemoryMmap> {
+        match self.device_state {
+            DeviceState::Activated(ref memory, _) => Ok(memory),
+            DeviceState::Inactive => Err(io::Error::other("virtio-mem device is inactive")),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn host_range(&self, guest_addr: u64, len: u64) -> io::Result<*mut u8> {
+        let memory = self.guest_memory()?;
+        let len = usize::try_from(len).map_err(|_| io::Error::other("range exceeds host address space"))?;
+        if !memory.check_range(GuestAddress(guest_addr), len) {
+            return Err(io::Error::other("virtio-mem range is not mapped RAM"));
+        }
+        memory.get_host_address(GuestAddress(guest_addr)).map_err(io::Error::other)
+    }
+
+    /// Ask the VMM worker to change a hypervisor mapping and wait for its answer.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn vmm_request(
+        &self,
+        what: &str,
+        message: impl FnOnce(crossbeam_channel::Sender<bool>) -> WorkerMessage,
+    ) -> io::Result<()> {
+        let sender = self
+            .map_sender
+            .as_ref()
+            .ok_or_else(|| io::Error::other("virtio-mem has no VMM channel"))?;
+        let (reply, answer) = crossbeam_channel::bounded(1);
+        sender
+            .send(message(reply))
+            .map_err(|_| io::Error::other("the VMM worker is gone"))?;
+        match answer.recv() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(io::Error::other(format!("the VMM could not {what}"))),
+            Err(_) => Err(io::Error::other("the VMM worker did not answer")),
+        }
+    }
+
+    /// Give a range that the guest plugs its host memory.
+    #[cfg(target_os = "windows")]
+    fn back_range(&self, guest_addr: u64, len: u64) -> io::Result<()> {
+        if self.map_sender.is_none() {
+            return Ok(());
+        }
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE};
+        let host = self.host_range(guest_addr, len)?;
+        // SAFETY: the range lies inside the reserved hotplug region of this process.
+        let committed = unsafe { VirtualAlloc(host.cast(), len as usize, MEM_COMMIT, PAGE_READWRITE) };
+        if committed.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        if let Err(error) = self.vmm_request("map plugged RAM", |reply| {
+            WorkerMessage::RamMap(reply, host as u64, guest_addr, len)
+        }) {
+            // SAFETY: the range was committed above and is not mapped into the partition.
+            unsafe { VirtualFree(host.cast(), len as usize, MEM_DECOMMIT) };
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn back_range(&self, _guest_addr: u64, _len: u64) -> io::Result<()> {
+        // Unix hosts back the hotplug region lazily from the boot mapping.
+        Ok(())
+    }
+
+    /// Give the host memory of a range back and leave it reading as zero.
+    #[cfg(target_os = "windows")]
+    fn release_backing(&self, guest_addr: u64, len: u64) -> io::Result<()> {
+        if self.map_sender.is_none() {
+            // No VMM worker (a unit test or an embedder without one): keep the old behavior.
+            return zero_guest_range(self.guest_memory()?, guest_addr, len);
+        }
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_DECOMMIT};
+        let host = self.host_range(guest_addr, len)?;
+        self.vmm_request("unmap unplugged RAM", |reply| {
+            WorkerMessage::RamUnmap(reply, guest_addr, len)
+        })?;
+        // SAFETY: the range lies inside the hotplug region and the partition no longer maps it.
+        // A later commit gives zero pages.
+        if unsafe { VirtualFree(host.cast(), len as usize, MEM_DECOMMIT) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn release_backing(&self, guest_addr: u64, len: u64) -> io::Result<()> {
+        if self.map_sender.is_none() {
+            // No VMM worker (a unit test or an embedder without one): keep the old behavior.
+            return zero_guest_range(self.guest_memory()?, guest_addr, len);
+        }
+        let host = self.host_range(guest_addr, len)?;
+        self.vmm_request("unmap unplugged RAM", |reply| {
+            WorkerMessage::RamUnmap(reply, guest_addr, len)
+        })?;
+        // SAFETY: the range lies inside the anonymous hotplug mapping and the hypervisor no
+        // longer maps it. MAP_FIXED replaces its pages with new zero-fill pages, which frees
+        // the old ones at once.
+        let replaced = unsafe {
+            libc::mmap(
+                host.cast(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if replaced == libc::MAP_FAILED || replaced != host.cast() {
+            return Err(io::Error::last_os_error());
+        }
+        self.vmm_request("map unplugged RAM again", |reply| {
+            WorkerMessage::RamMap(reply, host as u64, guest_addr, len)
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn release_backing(&self, guest_addr: u64, len: u64) -> io::Result<()> {
+        zero_guest_range(self.guest_memory()?, guest_addr, len)
     }
 
     pub fn process_req_queue(&mut self) -> bool {

@@ -305,6 +305,19 @@ impl Vm {
         }
     }
 
+    /// Map hot-plugged guest RAM with the flags of boot RAM.
+    pub fn map_ram(&self, reply_sender: Sender<bool>, host_addr: u64, guest_addr: u64, len: u64) {
+        debug!("map_ram: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        let ok = match self.hvf_vm.map_memory(host_addr, guest_addr, len) {
+            Ok(()) => true,
+            Err(e) => {
+                error!("Error mapping hot-plugged RAM: {e:?}");
+                false
+            }
+        };
+        reply_sender.send(ok).unwrap();
+    }
+
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {

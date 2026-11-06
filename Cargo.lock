@@ -908,8 +908,6 @@ dependencies = [
 [[package]]
 name = "msb-vm-memory"
 version = "0.18.0-msb.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6646492f6bc51c4126c73854d377ba8ce4cebb1443cc9efe2517ab2215d87b49"
 dependencies = [
  "libc",
  "thiserror 2.0.18",
