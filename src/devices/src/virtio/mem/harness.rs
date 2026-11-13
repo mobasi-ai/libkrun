@@ -218,7 +218,6 @@ pub struct Stats {
 pub struct Harness {
     device: Mem,
     memory: GuestMemoryMmap,
-    domain: MemoryAccessDomain,
     host_base: usize,
     /// The model: one entry for each block, true when plugged.
     plugged: Vec<bool>,
@@ -314,7 +313,6 @@ impl Harness {
         Self {
             device,
             memory,
-            domain: MemoryAccessDomain::new(),
             host_base,
             plugged: vec![false; BLOCKS],
             requested: 0,
@@ -649,7 +647,9 @@ impl Harness {
         queue.desc_table = GuestAddress(DESC_TABLE);
         queue.avail_ring = GuestAddress(AVAIL_RING);
         queue.used_ring = GuestAddress(USED_RING);
-        queue.set_memory_access_domain(&self.domain);
+        // A new domain for each queue: a domain keeps an entry for each queue that registered
+        // with it until the VM is paused, and the harness makes one queue for each request.
+        queue.set_memory_access_domain(&MemoryAccessDomain::new());
         let interrupt =
             InterruptTransport::new(DummyIrqChip::new().into(), "mem-harness".into()).unwrap();
         self.device
