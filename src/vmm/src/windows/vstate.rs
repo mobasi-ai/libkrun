@@ -26,9 +26,9 @@ use utils::{eventfd::EventFd, metrics::MetricsWriter};
 #[cfg(target_arch = "x86_64")]
 use vm_memory::Bytes;
 use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
-use windows_sys::Win32::System::Memory::{
-    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RESERVE,
-};
+#[cfg(any(test, target_arch = "x86_64"))]
+use windows_sys::Win32::System::Memory::MEM_COMMIT;
+use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_RESERVE};
 use windows_sys::Win32::Foundation::FILETIME;
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::Foundation::{E_FAIL, E_INVALIDARG, S_OK};
@@ -2485,6 +2485,7 @@ fn host_page_state(addr: *const u8) -> u32 {
 /// A virtio-mem range that the guest does not have plugged is in guest memory but has no host
 /// memory. A guest that touches it gets a memory access exit, and the access must fail here:
 /// a host read or write of the range would end the VMM with an access violation.
+#[cfg(target_arch = "x86_64")]
 fn guest_access_is_backed(guest_mem: &GuestMemoryMmap, guest_addr: u64, len: usize) -> bool {
     let last = guest_addr.saturating_add(len.saturating_sub(1) as u64);
     [guest_addr, last].into_iter().all(|addr| {
@@ -4063,6 +4064,10 @@ unsafe extern "system" fn emulator_translate_gva_callback(
 //--------------------------------------------------------------------------------------------------
 // Tests
 //--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "hotplug_tests.rs"]
+mod hotplug_tests;
 
 #[cfg(test)]
 mod tests {

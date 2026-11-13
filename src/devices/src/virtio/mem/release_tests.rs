@@ -342,3 +342,18 @@ fn host_access_to_an_unplugged_range_is_an_access_violation() {
         .unwrap();
     assert_eq!(status.code(), Some(0xC000_0005_u32 as i32));
 }
+
+/// Writes a seed corpus for the fuzz target, so that the fuzzer starts from long runs that
+/// plug and unplug many blocks:
+/// `MEM_FUZZ_SEEDS=<folder> cargo test -p msb_krun_devices --lib write_fuzz_seeds -- --ignored`
+#[test]
+#[ignore = "writes files; run it by name with MEM_FUZZ_SEEDS set"]
+fn write_fuzz_seeds() {
+    let folder = std::path::PathBuf::from(std::env::var_os("MEM_FUZZ_SEEDS").unwrap());
+    std::fs::create_dir_all(&folder).unwrap();
+    for seed in 1..=32u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let bytes: Vec<u8> = (0..100).flat_map(|_| rng.step()).collect();
+        std::fs::write(folder.join(format!("seed-{seed:02}")), bytes).unwrap();
+    }
+}

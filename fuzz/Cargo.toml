@@ -1,0 +1,27 @@
+# Fuzz targets for the Mobasi changes. Run with cargo-fuzz and a nightly toolchain:
+#   cargo +nightly fuzz run virtio_mem_requests -- -max_len=1200
+[package]
+name = "msb_krun_fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+devices = { package = "msb_krun_devices", path = "../src/devices", features = ["test_utils"] }
+
+[[bin]]
+name = "virtio_mem_requests"
+path = "fuzz_targets/virtio_mem_requests.rs"
+test = false
+doc = false
+bench = false
+
+# The fuzz crate is its own workspace, so it repeats the patch of the root manifest.
+[workspace]
+
+[patch.crates-io]
+msb-vm-memory = { path = "../third_party/msb-vm-memory" }

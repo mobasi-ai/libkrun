@@ -50,7 +50,7 @@ const NOWHERE: u64 = 0x10_0000;
 /// Offsets in a block that hold its tag. The harness reads them as zero in an unplugged block.
 const TAG_OFFSETS: [u64; 3] = [0, BLOCK / 2, BLOCK - 8];
 #[cfg(unix)]
-const GUARD: usize = 1 << 20;
+const GUARD: usize = 64 << 10;
 #[cfg(unix)]
 const GUARD_BYTE: u8 = 0xc3;
 
