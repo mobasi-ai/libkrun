@@ -144,9 +144,10 @@ pub(super) fn replace_with_zero_pages(range: &HostRange) -> io::Result<()> {
 #[cfg(target_os = "windows")]
 const COMMIT_RESERVE: u64 = 512 << 20;
 
-/// The most that one step commits before the commit reserve is checked again.
+/// The most that one step commits before the commit reserve is checked again. The tests use a
+/// small step, so that a range of the test region takes more than one.
 #[cfg(target_os = "windows")]
-const COMMIT_STEP: usize = 64 << 20;
+const COMMIT_STEP: usize = if cfg!(test) { 8 << 20 } else { 64 << 20 };
 
 /// Commit a reserved range and keep the commit reserve. The new pages read as zero. On failure
 /// nothing is committed.
@@ -181,8 +182,9 @@ pub(super) fn commit(range: &HostRange) -> io::Result<()> {
                     guest_addr: range.guest_addr,
                     len: done,
                 };
+                // An unplugged range must not stay committed.
                 if let Err(error) = decommit(&partial) {
-                    warn!("virtio-mem: cannot decommit a range that was not plugged: {error}");
+                    fail_stop("decommit a range that was not plugged", &error);
                 }
             }
             return Err(error);

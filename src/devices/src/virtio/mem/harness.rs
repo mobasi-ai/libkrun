@@ -377,10 +377,20 @@ impl Harness {
         self.hypervisor.refuse_next_map.store(true, Ordering::SeqCst);
     }
 
-    /// Act as a driver that acknowledged no feature of the device.
-    pub fn forget_features(&mut self) {
-        self.device.acked_features = 0;
-        self.features_acked = false;
+    /// Act as a driver that starts after a device reset and writes both features pages, as the
+    /// transport passes them to the device. `all` acknowledges each feature that the device
+    /// offers; otherwise the driver acknowledges none.
+    pub fn negotiate(&mut self, all: bool) {
+        let offered = self.device.avail_features;
+        let (low, high) = if all { (offered as u32, (offered >> 32) as u32) } else { (0, 0) };
+        self.device.ack_features_by_page(0, low);
+        self.device.ack_features_by_page(1, high);
+        self.features_acked = all;
+    }
+
+    /// The device, for a test of a call that the harness does not model.
+    pub fn device(&mut self) -> &mut Mem {
+        &mut self.device
     }
 
     /// Tell the model that Windows will refuse the commit of the next plug that reaches it. The

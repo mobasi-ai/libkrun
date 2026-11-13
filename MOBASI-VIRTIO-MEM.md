@@ -55,7 +55,8 @@ size.
 | --- | --- |
 | The host cannot commit a plugged range (Windows error 1455), or the commit reserve of 512 MiB would be used | The answer is `BUSY`. Nothing changed. The Linux driver asks again after a delay. |
 | The hypervisor refuses to map a plugged range (Windows) | The mapper unmaps the range, so that no part of it stays mapped. The range is decommitted. The answer is `BUSY`. If that unmap fails, the VM process stops. |
-| The driver did not acknowledge `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE` (Windows) | A plug gets `ERROR`. Such a driver can read unplugged memory, which stops the VM on Windows, so it gets no memory. Linux 5.16 and later acknowledge the feature. |
+| The driver did not acknowledge `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE` (Windows) | A plug gets `ERROR`. Such a driver can read unplugged memory, which stops the VM on Windows, so it gets no memory. Linux 5.16 and later acknowledge the feature. A write of a features page replaces the page, so a driver that starts after a device reset does not inherit the acknowledgement of the driver before it. |
+| A commit step or a map failed, and the decommit of what was committed fails too (Windows) | The VM process stops. An unplugged range must not stay committed: the VMM answers a guest access to committed memory that is not mapped from the host memory. |
 | The hypervisor refuses to unmap (Windows) | The answer is `BUSY`. The range stays plugged, committed, and mapped. |
 | The VMM refuses to unmap because first-write tracking is active (macOS) | The range is zeroed in place, as upstream does. It stays mapped. |
 | `mmap` cannot replace the pages (macOS) | The range is mapped again and zeroed in place. |
@@ -85,8 +86,9 @@ These limits are accepted. Each one stays inside the VM of the guest.
 ## What is not supported
 
 - **Windows: memory capture, restore, and dirty tracking** of a VM with a reserved hotplug
-  region. The calls return an error. Hot-plugged ranges are mapped outside the regions that
-  dirty tracking knows.
+  region, and the restore of the virtio-mem device state. The calls return an error.
+  Hot-plugged ranges are mapped outside the regions that dirty tracking knows, and a restored
+  bitmap would not equal what the host backs.
 - **Windows: NUMA placement or private memory together with the release.** The region is then
   committed and mapped at boot, and the device keeps the upstream behavior.
 - **macOS: memory of the boot RAM** is not given back. Only unplugged blocks are. Start a VM

@@ -293,6 +293,20 @@ impl Mem {
         Ok((config, blocks))
     }
 
+    /// On Windows with a mapper, a plugged block is one that this device committed and mapped,
+    /// and no other. A restored bitmap would name blocks that have no host memory, or drop
+    /// blocks that have it. Memory capture and restore are refused for such a VM, and so is the
+    /// restore of the device state.
+    fn refuse_restore_into_reserved_memory(&self) -> Result<(), VirtioStateError> {
+        #[cfg(target_os = "windows")]
+        if self.mapper.is_some() {
+            return Err(VirtioStateError::Incompatible(
+                "virtio-mem cannot restore its state into reserved hotplug memory".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Map a guest request range onto block indices, if fully inside the region.
     fn block_range(&self, addr: u64, nb_blocks: u16) -> Option<std::ops::Range<usize>> {
         if nb_blocks == 0 {
@@ -470,10 +484,11 @@ impl Mem {
         let range = self.host_range(guest_addr, len)?;
         backing::commit(&range)?;
         if let Err(error) = mapper.map(range.host_addr(), range.guest_addr(), range.len()) {
-            // The mapper leaves nothing mapped when a map fails, so the commit can go back. A
-            // range that stays committed costs commit and nothing else: the guest cannot reach it.
+            // The mapper leaves nothing mapped when a map fails, so the commit can go back. An
+            // unplugged range must not stay committed: the VMM answers a guest access to
+            // committed memory that is not mapped from the host memory.
             if let Err(error) = backing::decommit(&range) {
-                warn!("virtio-mem: cannot decommit a range that was not plugged: {error}");
+                backing::fail_stop("decommit a range that was not plugged", &error);
             }
             return Err(error);
         }
@@ -496,7 +511,10 @@ impl Mem {
         };
         let busy = |error: io::Error| io::Error::new(io::ErrorKind::ResourceBusy, error);
         let range = self.host_range(guest_addr, len).map_err(busy)?;
-        // Unmap first: the partition must not keep a range that the host takes back.
+        // Unmap first: the partition must not keep a range that the host takes back. After a
+        // refused unmap the range stays plugged and committed. If the partition unmapped a part
+        // of it, the guest still reaches that part: the VMM answers the access from the host
+        // memory, and the next unplug of the range unmaps the rest.
         mapper
             .unmap(range.guest_addr(), range.len())
             .map_err(busy)?;
@@ -675,6 +693,23 @@ impl VirtioDevice for Mem {
         self.acked_features = acked_features
     }
 
+    /// A write of a features page replaces what the driver acknowledged in that page.
+    ///
+    /// The transport keeps the acknowledged features across a device reset. The default adds
+    /// bits, so a driver that starts after a reset would inherit an acknowledgement of the
+    /// driver before it, and Windows would give it memory that it can read while unplugged.
+    fn ack_features_by_page(&mut self, page: u32, value: u32) {
+        let (mask, bits) = match page {
+            0 => (u64::from(u32::MAX), u64::from(value)),
+            1 => (u64::from(u32::MAX) << 32, u64::from(value) << 32),
+            _ => {
+                warn!("virtio-mem: cannot acknowledge unknown features page: {page}");
+                return;
+            }
+        };
+        self.acked_features = (self.acked_features & !mask) | (bits & self.avail_features);
+    }
+
     fn device_type(&self) -> u32 {
         uapi::VIRTIO_ID_MEM
     }
@@ -802,6 +837,7 @@ impl VirtioDevice for Mem {
     }
 
     fn validate_device_state(&self, state: &[u8]) -> Result<(), VirtioStateError> {
+        self.refuse_restore_into_reserved_memory()?;
         self.decode_checkpoint_state(state).map(|_| ())
     }
 
@@ -811,15 +847,8 @@ impl VirtioDevice for Mem {
                 "virtio-mem must be inactive before restore",
             ));
         }
+        self.refuse_restore_into_reserved_memory()?;
         let (config, blocks) = self.decode_checkpoint_state(state)?;
-        // On Windows a plugged block is one that this device committed and mapped. A restored
-        // bitmap would name blocks that have no host memory.
-        #[cfg(target_os = "windows")]
-        if self.mapper.is_some() && blocks.iter().any(|plugged| *plugged) {
-            return Err(VirtioStateError::Incompatible(
-                "virtio-mem cannot restore plugged blocks into reserved hotplug memory".into(),
-            ));
-        }
         self.config = config;
         self.plugged_blocks = blocks;
         Ok(())

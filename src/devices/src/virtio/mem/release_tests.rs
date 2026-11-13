@@ -315,6 +315,12 @@ fn a_commit_that_windows_refuses_answers_busy_and_changes_nothing() {
         harness.expect_refused_commit();
         assert_eq!(harness.plug(1, 8), VIRTIO_MEM_RESP_BUSY);
 
+        // The reserve holds for the first two steps of 8 MiB and fails after the third. The
+        // three steps go back.
+        limit_process_commit(&mut job, process_commit() + (512 << 20) + (20 << 20));
+        harness.expect_refused_commit();
+        assert_eq!(harness.plug(1, 16), VIRTIO_MEM_RESP_BUSY);
+
         // Less than the range is left: Windows refuses the commit itself.
         limit_process_commit(&mut job, process_commit() + (8 << 20));
         harness.expect_refused_commit();
@@ -331,16 +337,44 @@ fn a_commit_that_windows_refuses_answers_busy_and_changes_nothing() {
 }
 
 /// A driver that did not acknowledge VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE can read unplugged
-/// memory, which stops the VM on Windows. The device gives such a driver no memory.
+/// memory, which stops the VM on Windows. The device gives such a driver no memory. The
+/// transport keeps acknowledged features across a device reset, so the acknowledgement of one
+/// driver must not pass to the driver that starts after it.
 #[cfg(target_os = "windows")]
 #[test]
 fn a_driver_that_can_read_unplugged_memory_gets_no_memory() {
     let mut harness = Harness::new();
     harness.set_requested(BLOCKS);
-    harness.forget_features();
-    assert_eq!(harness.plug(0, 1), VIRTIO_MEM_RESP_ERROR);
-    assert!(harness.plugged().iter().all(|plugged| !*plugged));
+    assert_eq!(harness.plug(0, 1), VIRTIO_MEM_RESP_ACK);
+    // The guest resets the device, and a driver that knows no feature starts.
+    harness.negotiate(false);
+    assert_eq!(harness.plug(4, 1), VIRTIO_MEM_RESP_ERROR);
+    // It can still give memory back.
+    assert_eq!(harness.unplug(0, 1), VIRTIO_MEM_RESP_ACK);
+    // A driver that acknowledges the feature gets memory again.
+    harness.negotiate(true);
+    assert_eq!(harness.plug(4, 1), VIRTIO_MEM_RESP_ACK);
     harness.finish();
+}
+
+/// On Windows a plugged block is one that the device committed and mapped. A restored device
+/// state would change the bitmap and not the host memory, so the device refuses it: also an
+/// empty state, which would drop blocks that are committed and mapped.
+#[cfg(target_os = "windows")]
+#[test]
+fn a_device_with_reserved_memory_refuses_a_restored_state() {
+    let mut harness = Harness::new();
+    let empty = harness.device().capture_device_state().unwrap();
+    harness.set_requested(BLOCKS);
+    assert_eq!(harness.plug(0, 2), VIRTIO_MEM_RESP_ACK);
+    let plugged = harness.device().capture_device_state().unwrap();
+    for state in [&empty, &plugged] {
+        assert!(harness.device().validate_device_state(state).is_err());
+        assert!(harness.device().restore_device_state(state).is_err());
+    }
+    // The device is as before: the harness checks the bitmap, the commit, and the mapping.
+    harness.finish();
+    assert_eq!(harness.unplug(0, 2), VIRTIO_MEM_RESP_ACK);
 }
 
 /// Host threads of other devices hold pointers into guest memory. On Unix a thread that reads
