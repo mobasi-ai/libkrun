@@ -140,8 +140,35 @@ fn hostile_addresses_and_counts_change_nothing() {
     harness.finish();
 }
 
+/// Run `body` in a new process that runs only the named test. The other tests of this file
+/// commit and decommit memory at the same time, and the commit of a process is one number.
+#[cfg(target_os = "windows")]
+fn alone(test: &str, body: impl FnOnce()) {
+    const CHILD: &str = "MEM_TEST_ALONE";
+    if std::env::var_os(CHILD).is_some() {
+        return body();
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("virtio::mem::device::release_tests::{test}"),
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "{test} failed in its own process");
+}
+
 #[test]
 fn unplug_gives_the_host_memory_back() {
+    #[cfg(target_os = "windows")]
+    alone("unplug_gives_the_host_memory_back", release_and_measure);
+    #[cfg(unix)]
+    release_and_measure();
+}
+
+fn release_and_measure() {
     let mut harness = Harness::new();
     harness.set_requested(BLOCKS);
     let (host, _) = harness.host_region();
@@ -229,11 +256,9 @@ fn unplug_all_records_each_released_run() {
 fn a_refused_map_leaves_the_range_reserved() {
     let mut harness = Harness::new();
     harness.set_requested(BLOCKS);
-    let before = process_commit();
     harness.refuse_next_map();
     // The harness checks that the range is not committed and not mapped after the refusal.
     assert_eq!(harness.plug(0, 8), VIRTIO_MEM_RESP_BUSY);
-    assert!(process_commit() < before + BLOCK);
     assert_eq!(harness.plug(0, 8), VIRTIO_MEM_RESP_ACK);
     harness.finish();
 }
