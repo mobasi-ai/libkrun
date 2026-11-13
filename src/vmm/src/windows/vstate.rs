@@ -2480,18 +2480,18 @@ fn host_page_state(addr: *const u8) -> u32 {
     }
 }
 
-/// True when the host memory of a guest access is committed.
+/// True when a guest access is to guest RAM that has no host memory now.
 ///
-/// A virtio-mem range that the guest does not have plugged is in guest memory but has no host
-/// memory. A guest that touches it gets a memory access exit, and the access must fail here:
-/// a host read or write of the range would end the VMM with an access violation.
+/// A virtio-mem range that the guest does not have plugged is in guest memory, but its host
+/// memory is only reserved. A guest that touches it gets a memory access exit. The access must
+/// fail without a host read or write: that would end the VMM with an access violation.
 #[cfg(target_arch = "x86_64")]
-fn guest_access_is_backed(guest_mem: &GuestMemoryMmap, guest_addr: u64, len: usize) -> bool {
+fn guest_access_is_not_backed(guest_mem: &GuestMemoryMmap, guest_addr: u64, len: usize) -> bool {
     let last = guest_addr.saturating_add(len.saturating_sub(1) as u64);
-    [guest_addr, last].into_iter().all(|addr| {
+    [guest_addr, last].into_iter().any(|addr| {
         guest_mem
             .get_host_address(GuestAddress(addr))
-            .is_ok_and(|host| host_page_state(host.cast_const()) == MEM_COMMIT)
+            .is_ok_and(|host| host_page_state(host.cast_const()) != MEM_COMMIT)
     })
 }
 
@@ -3927,7 +3927,7 @@ unsafe extern "system" fn emulator_memory_callback(
                 }
             }
 
-            if !guest_access_is_backed(&context.guest_mem, memory_access.GpaAddress, len) {
+            if guest_access_is_not_backed(&context.guest_mem, memory_access.GpaAddress, len) {
                 error!(
                     "WHP read of guest memory that is not plugged: vcpu={} gpa=0x{:x}",
                     context.id, memory_access.GpaAddress
@@ -3956,7 +3956,7 @@ unsafe extern "system" fn emulator_memory_callback(
                 }
             }
 
-            if !guest_access_is_backed(&context.guest_mem, memory_access.GpaAddress, len) {
+            if guest_access_is_not_backed(&context.guest_mem, memory_access.GpaAddress, len) {
                 error!(
                     "WHP write of guest memory that is not plugged: vcpu={} gpa=0x{:x}",
                     context.id, memory_access.GpaAddress

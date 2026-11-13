@@ -835,6 +835,14 @@ impl VirtioDevice for Mem {
             ));
         }
         let (config, blocks) = self.decode_checkpoint_state(state)?;
+        // On Windows a plugged block is one that this device committed and mapped. A restored
+        // bitmap would name blocks that have no host memory.
+        #[cfg(target_os = "windows")]
+        if self.map_sender.is_some() && blocks.iter().any(|plugged| *plugged) {
+            return Err(VirtioStateError::Incompatible(
+                "virtio-mem cannot restore plugged blocks into reserved hotplug memory".into(),
+            ));
+        }
         self.config = config;
         self.plugged_blocks = blocks;
         Ok(())
