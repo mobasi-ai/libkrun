@@ -601,7 +601,8 @@ pub struct WhpCapabilities {
 }
 
 pub struct Vm {
-    partition: Partition,
+    /// Shared with the mapper of hot-plugged RAM, so that the partition lives as long as both.
+    partition: Arc<Partition>,
     memory_regions: Vec<MappedMemoryRegion>,
     /// True when a region of guest memory was only reserved at boot (virtio-mem hotplug RAM).
     reserved_ram: bool,
@@ -1021,7 +1022,11 @@ impl Vm {
             return Err(Error::VcpuCountZero);
         }
 
-        let partition = Partition::with_clock(vcpu_count, nested_enabled, tsc_frequency_hz)?;
+        let partition = Arc::new(Partition::with_clock(
+            vcpu_count,
+            nested_enabled,
+            tsc_frequency_hz,
+        )?);
 
         Ok(Self {
             partition,
@@ -1400,32 +1405,14 @@ impl Vm {
         }
     }
 
-    /// Map hot-plugged guest RAM with the flags of boot RAM. The host range must be committed.
-    pub fn map_ram(&self, reply_sender: Sender<bool>, host_addr: u64, guest_addr: u64, len: u64) {
-        debug!("map_ram: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
-        let ok = match map_gpa_range(self.partition.handle, host_addr as *const u8, guest_addr, len) {
-            Ok(()) => true,
-            Err(err) => {
-                error!("{err}");
-                // The device decommits the range after a failed map. Leave no part of it mapped.
-                let _ = unmap_gpa_range(self.partition.handle, guest_addr, len);
-                false
-            }
-        };
-        reply_sender.send(ok).unwrap();
-    }
-
-    /// Unmap hot-plugged guest RAM so that the device can decommit its host memory.
-    pub fn unmap_ram(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
-        debug!("unmap_ram: guest_addr={guest_addr:x}, len={len}");
-        let ok = match unmap_gpa_range(self.partition.handle, guest_addr, len) {
-            Ok(()) => true,
-            Err(err) => {
-                error!("{err}");
-                false
-            }
-        };
-        reply_sender.send(ok).unwrap();
+    /// The mapper that the virtio-mem device uses for its hot-plugged RAM, when a region of
+    /// guest memory was only reserved at boot.
+    pub fn ram_mapper(&self) -> Option<Box<dyn devices::virtio::RamMapper>> {
+        self.reserved_ram.then(|| {
+            Box::new(WhpRamMapper {
+                partition: Arc::clone(&self.partition),
+            }) as Box<dyn devices::virtio::RamMapper>
+        })
     }
 
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
@@ -1445,6 +1432,39 @@ impl Vm {
 
     pub fn create_vcpu(&self, id: u8, exit_evt: EventFd, metrics: MetricsWriter) -> Result<Vcpu> {
         Vcpu::new(id, self.partition.handle, exit_evt, metrics)
+    }
+}
+
+/// Maps and unmaps hot-plugged RAM for the virtio-mem device.
+///
+/// The device calls it on its own thread with the device lock held. It takes no lock of the VMM,
+/// so it cannot wait for a thread that waits for the device.
+struct WhpRamMapper {
+    partition: Arc<Partition>,
+}
+
+impl devices::virtio::RamMapper for WhpRamMapper {
+    /// The host range must be committed.
+    fn map(&self, host_addr: u64, guest_addr: u64, len: u64) -> std::io::Result<()> {
+        debug!("map hot-plugged RAM: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        let Err(error) = map_gpa_range(self.partition.handle, host_addr as *const u8, guest_addr, len)
+        else {
+            return Ok(());
+        };
+        // The device decommits the range after a failed map, so no part of it can stay mapped.
+        // An unmap of a range that is not mapped succeeds. If the unmap fails, the state of the
+        // mapping is not known, and the VM must not continue.
+        if let Err(cleanup) = unmap_gpa_range(self.partition.handle, guest_addr, len) {
+            error!("{error}; then {cleanup}; the VM stops");
+            std::process::abort();
+        }
+        Err(std::io::Error::other(error.to_string()))
+    }
+
+    fn unmap(&self, guest_addr: u64, len: u64) -> std::io::Result<()> {
+        debug!("unmap hot-plugged RAM: guest_addr={guest_addr:x}, len={len}");
+        unmap_gpa_range(self.partition.handle, guest_addr, len)
+            .map_err(|error| std::io::Error::other(error.to_string()))
     }
 }
 

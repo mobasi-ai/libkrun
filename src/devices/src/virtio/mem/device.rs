@@ -2,8 +2,6 @@ use std::cmp;
 use std::io::{self, Write};
 
 use utils::eventfd::EventFd;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use utils::worker_message::WorkerMessage;
 #[cfg(target_os = "linux")]
 use vm_memory::{Address, GuestMemoryRegion};
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
@@ -14,6 +12,8 @@ use super::super::{
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use super::backing::{self, HostRange};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use super::RamMapper;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 
@@ -116,10 +116,11 @@ pub struct Mem {
     config: VirtioMemConfig,
     /// One bit per block; set = plugged.
     plugged_blocks: Vec<bool>,
-    /// Asks the VMM to map or unmap guest RAM in the hypervisor. On macOS and Windows the
-    /// host backing of a block is released only after the block is unmapped.
+    /// Maps and unmaps hot-plugged RAM in the hypervisor. With a mapper, the device gives the
+    /// host memory of unplugged ranges back; the hypervisor does not map a range while the host
+    /// replaces or decommits its memory.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    map_sender: Option<crossbeam_channel::Sender<WorkerMessage>>,
+    mapper: Option<Box<dyn RamMapper>>,
 }
 
 impl Mem {
@@ -139,23 +140,23 @@ impl Mem {
             },
             plugged_blocks: Vec::new(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            map_sender: None,
+            mapper: None,
         })
     }
 
-    /// Give the device the channel to the VMM worker for RAM map and unmap requests.
+    /// Give the device the mapper of its hot-plugged RAM.
     ///
-    /// With the channel, the device gives the host memory of unplugged ranges back. On Windows
+    /// With the mapper, the device gives the host memory of unplugged ranges back. On Windows
     /// the hotplug region must then be only reserved at boot, and not mapped.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub fn set_map_sender(&mut self, sender: crossbeam_channel::Sender<WorkerMessage>) {
+    pub fn set_ram_mapper(&mut self, mapper: Box<dyn RamMapper>) {
         // Windows decommits an unplugged range, so a guest that reads it stops. The Linux driver
         // acknowledges this feature and then does not touch unplugged memory.
         #[cfg(target_os = "windows")]
         {
             self.avail_features |= 1 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE;
         }
-        self.map_sender = Some(sender);
+        self.mapper = Some(mapper);
     }
 
     pub fn id(&self) -> &str {
@@ -319,6 +320,15 @@ impl Mem {
         {
             return resp(VIRTIO_MEM_RESP_NACK, 0);
         }
+        // A driver that did not acknowledge the feature can read unplugged memory, which stops
+        // the VM on Windows. Give such a driver no memory.
+        #[cfg(target_os = "windows")]
+        if self.mapper.is_some()
+            && self.acked_features & (1 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE) == 0
+        {
+            warn!("virtio-mem: the driver did not acknowledge that unplugged memory is inaccessible");
+            return resp(VIRTIO_MEM_RESP_ERROR, 0);
+        }
         // Ownership transitions are changes even if the guest has not written the newly plugged
         // pages. Mark before publishing the bitmap so incremental capture cannot inherit stale RAM.
         if let Err(error) = self.mark_transition(addr, add) {
@@ -450,46 +460,17 @@ impl Mem {
         )
     }
 
-    /// Ask the VMM worker to change a hypervisor mapping and wait for its answer.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn vmm_request(
-        &self,
-        what: &str,
-        message: impl FnOnce(crossbeam_channel::Sender<bool>) -> WorkerMessage,
-    ) -> io::Result<()> {
-        let sender = self
-            .map_sender
-            .as_ref()
-            .ok_or_else(|| io::Error::other("virtio-mem has no VMM channel"))?;
-        let (reply, answer) = crossbeam_channel::bounded(1);
-        sender
-            .send(message(reply))
-            .map_err(|_| io::Error::other("the VMM worker is gone"))?;
-        match answer.recv() {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(io::Error::other(format!("the VMM could not {what}"))),
-            Err(_) => Err(io::Error::other("the VMM worker did not answer")),
-        }
-    }
-
     /// Give a range that the guest plugs its host memory. On failure nothing changed.
     #[cfg(target_os = "windows")]
     fn back_range(&self, guest_addr: u64, len: u64) -> io::Result<()> {
-        if self.map_sender.is_none() {
+        let Some(mapper) = &self.mapper else {
             // The hotplug region was committed and mapped at boot.
             return Ok(());
-        }
+        };
         let range = self.host_range(guest_addr, len)?;
         backing::commit(&range)?;
-        // Commit first, so that Windows can grow a page file that it manages. Then keep a
-        // reserve for the VMM, and map the range.
-        let mapped = backing::commit_headroom().and_then(|()| {
-            self.vmm_request("map plugged RAM", |reply| {
-                WorkerMessage::RamMap(reply, range.host_addr(), range.guest_addr(), range.len())
-            })
-        });
-        if let Err(error) = mapped {
-            // The VMM leaves nothing mapped when a map fails, so the commit can go back. A
+        if let Err(error) = mapper.map(range.host_addr(), range.guest_addr(), range.len()) {
+            // The mapper leaves nothing mapped when a map fails, so the commit can go back. A
             // range that stays committed costs commit and nothing else: the guest cannot reach it.
             if let Err(error) = backing::decommit(&range) {
                 warn!("virtio-mem: cannot decommit a range that was not plugged: {error}");
@@ -509,17 +490,16 @@ impl Mem {
     /// changed.
     #[cfg(target_os = "windows")]
     fn release_backing(&self, guest_addr: u64, len: u64) -> io::Result<()> {
-        if self.map_sender.is_none() {
+        let Some(mapper) = &self.mapper else {
             // The hotplug region stays committed and mapped: keep the bounded writes.
             return zero_guest_range(self.guest_memory()?, guest_addr, len);
-        }
+        };
         let busy = |error: io::Error| io::Error::new(io::ErrorKind::ResourceBusy, error);
         let range = self.host_range(guest_addr, len).map_err(busy)?;
         // Unmap first: the partition must not keep a range that the host takes back.
-        self.vmm_request("unmap unplugged RAM", |reply| {
-            WorkerMessage::RamUnmap(reply, range.guest_addr(), range.len())
-        })
-        .map_err(busy)?;
+        mapper
+            .unmap(range.guest_addr(), range.len())
+            .map_err(busy)?;
         if let Err(error) = backing::decommit(&range) {
             // The guest still owns the range and can no longer reach it.
             backing::fail_stop("decommit an unmapped range", &error);
@@ -530,26 +510,23 @@ impl Mem {
     #[cfg(target_os = "macos")]
     fn release_backing(&self, guest_addr: u64, len: u64) -> io::Result<()> {
         let memory = self.guest_memory()?;
-        // Without a VMM worker, or when the hotplug region is not plain anonymous memory, keep
-        // the bounded writes.
-        let range = match (self.map_sender.is_some(), self.host_range(guest_addr, len)) {
-            (true, Ok(range)) => range,
+        // Without a mapper, or when the hotplug region is not plain anonymous memory, keep the
+        // bounded writes.
+        let (mapper, range) = match (&self.mapper, self.host_range(guest_addr, len)) {
+            (Some(mapper), Ok(range)) => (mapper, range),
             _ => return zero_guest_range(memory, guest_addr, len),
         };
-        // The VMM refuses the unmap while it tracks first writes, because a new mapping would
-        // lose the write protection of the tracker. Nothing changed, so zero the range in place.
-        if let Err(error) = self.vmm_request("unmap unplugged RAM", |reply| {
-            WorkerMessage::RamUnmap(reply, range.guest_addr(), range.len())
-        }) {
+        // The mapper refuses the unmap while the VMM tracks first writes, because a new mapping
+        // would lose the write protection of the tracker. Nothing changed, so zero the range in
+        // place.
+        if let Err(error) = mapper.unmap(range.guest_addr(), range.len()) {
             debug!("virtio-mem: zero 0x{guest_addr:x} in place: {error}");
             return zero_guest_range(memory, guest_addr, len);
         }
         let replaced = backing::replace_with_zero_pages(&range);
         // Map the range again in both cases. It holds the new pages or, after a failure, the old
         // pages, and the guest must always find memory there.
-        if let Err(error) = self.vmm_request("map unplugged RAM again", |reply| {
-            WorkerMessage::RamMap(reply, range.host_addr(), range.guest_addr(), range.len())
-        }) {
+        if let Err(error) = mapper.map(range.host_addr(), range.guest_addr(), range.len()) {
             backing::fail_stop("map an unplugged range again", &error);
         }
         match replaced {
@@ -838,7 +815,7 @@ impl VirtioDevice for Mem {
         // On Windows a plugged block is one that this device committed and mapped. A restored
         // bitmap would name blocks that have no host memory.
         #[cfg(target_os = "windows")]
-        if self.map_sender.is_some() && blocks.iter().any(|plugged| *plugged) {
+        if self.mapper.is_some() && blocks.iter().any(|plugged| *plugged) {
             return Err(VirtioStateError::Incompatible(
                 "virtio-mem cannot restore plugged blocks into reserved hotplug memory".into(),
             ));

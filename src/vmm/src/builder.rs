@@ -1941,14 +1941,7 @@ pub fn build_microvm_paused(
     }
     #[cfg(not(feature = "tee"))]
     if let Some(mem_device) = vm_resources.mem_device.clone() {
-        attach_mem_device(
-            &mut vmm,
-            event_manager,
-            intc.clone(),
-            mem_device,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            _sender.clone(),
-        )?;
+        attach_mem_device(&mut vmm, event_manager, intc.clone(), mem_device)?;
         trace.mark("mem.attached");
     }
     #[cfg(not(feature = "tee"))]
@@ -4762,19 +4755,21 @@ fn attach_mem_device(
     event_manager: &mut EventManager,
     intc: IrqChip,
     mem_device: Arc<Mutex<devices::virtio::Mem>>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    // With the channel, the device gives the host memory of unplugged ranges back. On Windows it
+    // With the mapper, the device gives the host memory of unplugged ranges back. On Windows it
     // then commits and maps each range on plug, so the region must be only reserved at boot. A
-    // region that was committed and mapped at boot (NUMA placement, private memory) keeps the
-    // upstream behavior.
+    // region that was committed and mapped at boot (NUMA placement, private memory) has no
+    // mapper and keeps the upstream behavior.
     #[cfg(target_os = "macos")]
-    mem_device.lock().unwrap().set_map_sender(map_sender);
+    mem_device
+        .lock()
+        .unwrap()
+        .set_ram_mapper(vmm.vm.ram_mapper());
     #[cfg(target_os = "windows")]
-    if vmm.vm.has_reserved_ram() {
-        mem_device.lock().unwrap().set_map_sender(map_sender);
+    if let Some(mapper) = vmm.vm.ram_mapper() {
+        mem_device.lock().unwrap().set_ram_mapper(mapper);
     }
 
     event_manager

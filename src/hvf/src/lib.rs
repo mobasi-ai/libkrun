@@ -568,6 +568,41 @@ impl HvfVm {
     }
 }
 
+/// Maps guest RAM with read, write, and execute access, without a VM handle.
+///
+/// The virtio-mem device calls this free form on its own thread when it maps a range again after
+/// it replaced the host pages. Hypervisor.framework owns one process-wide VM.
+pub fn map_ram(host_start_addr: u64, guest_start_addr: u64, size: u64) -> Result<(), Error> {
+    let ret = unsafe {
+        hv_vm_map(
+            host_start_addr as *mut core::ffi::c_void,
+            guest_start_addr,
+            size.try_into().map_err(|_| Error::MemoryMap)?,
+            dax_mapping_flags(true),
+        )
+    };
+    if ret != HV_SUCCESS {
+        Err(Error::MemoryMap)
+    } else {
+        Ok(())
+    }
+}
+
+/// Unmaps guest RAM without a VM handle. See [`map_ram`].
+pub fn unmap_ram(guest_start_addr: u64, size: u64) -> Result<(), Error> {
+    let ret = unsafe {
+        hv_vm_unmap(
+            guest_start_addr,
+            size.try_into().map_err(|_| Error::MemoryUnmap)?,
+        )
+    };
+    if ret != HV_SUCCESS {
+        Err(Error::MemoryUnmap)
+    } else {
+        Ok(())
+    }
+}
+
 /// Changes the second-stage permissions for an existing guest-memory mapping.
 ///
 /// This free form is used by vCPU threads servicing first-write faults; Hypervisor.framework owns

@@ -144,16 +144,49 @@ pub(super) fn replace_with_zero_pages(range: &HostRange) -> io::Result<()> {
 #[cfg(target_os = "windows")]
 const COMMIT_RESERVE: u64 = 512 << 20;
 
-/// Commit a reserved range. The new pages read as zero.
+/// The most that one step commits before the commit reserve is checked again.
+#[cfg(target_os = "windows")]
+const COMMIT_STEP: usize = 64 << 20;
+
+/// Commit a reserved range and keep the commit reserve. The new pages read as zero. On failure
+/// nothing is committed.
+///
+/// A VMM whose own allocations fail aborts and takes the guest with it, and other programs need
+/// commit too. So the commit is made in steps, with a check of the reserve after each step: a
+/// guest that asks for a large range can take the system at most one step into the reserve, and
+/// only for the time of the check. The commit comes before the check so that Windows can grow a
+/// page file that it manages.
 #[cfg(target_os = "windows")]
 pub(super) fn commit(range: &HostRange) -> io::Result<()> {
     use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
-    // SAFETY: the call changes only the commit state of the range. Windows refuses a range
-    // that is not inside one reservation of this process.
-    let committed =
-        unsafe { VirtualAlloc(range.host.cast(), range.len, MEM_COMMIT, PAGE_READWRITE) };
-    if committed.is_null() {
-        return Err(io::Error::last_os_error());
+    let mut done = 0;
+    while done < range.len {
+        let step = (range.len - done).min(COMMIT_STEP);
+        // SAFETY: `done + step` is at most the length of the range. The call changes only the
+        // commit state of that part, and Windows refuses a part that is not inside one
+        // reservation of this process.
+        let committed = unsafe {
+            VirtualAlloc(range.host.add(done).cast(), step, MEM_COMMIT, PAGE_READWRITE)
+        };
+        let result = if committed.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            done += step;
+            commit_headroom()
+        };
+        if let Err(error) = result {
+            if done > 0 {
+                let partial = HostRange {
+                    host: range.host,
+                    guest_addr: range.guest_addr,
+                    len: done,
+                };
+                if let Err(error) = decommit(&partial) {
+                    warn!("virtio-mem: cannot decommit a range that was not plugged: {error}");
+                }
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -176,11 +209,8 @@ pub(super) fn decommit(range: &HostRange) -> io::Result<()> {
 
 /// Fail when less than [`COMMIT_RESERVE`] of commit is left, for the whole system (RAM plus
 /// page file) or under the per-process memory limit of the job that holds this process.
-///
-/// A VMM whose own allocations fail aborts and takes the guest with it. The caller commits
-/// first, so that Windows can grow a page file that it manages, and then calls this.
 #[cfg(target_os = "windows")]
-pub(super) fn commit_headroom() -> io::Result<()> {
+fn commit_headroom() -> io::Result<()> {
     use windows_sys::Win32::System::JobObjects::{
         JobObjectExtendedLimitInformation, QueryInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PROCESS_MEMORY,

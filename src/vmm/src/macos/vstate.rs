@@ -305,35 +305,11 @@ impl Vm {
         }
     }
 
-    /// Map hot-plugged guest RAM with the flags of boot RAM.
-    pub fn map_ram(&self, reply_sender: Sender<bool>, host_addr: u64, guest_addr: u64, len: u64) {
-        debug!("map_ram: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
-        let ok = match self.hvf_vm.map_memory(host_addr, guest_addr, len) {
-            Ok(()) => true,
-            Err(e) => {
-                error!("Error mapping hot-plugged RAM: {e:?}");
-                false
-            }
-        };
-        reply_sender.send(ok).unwrap();
-    }
-
-    /// Unmap hot-plugged guest RAM so that the device can replace its host pages.
-    ///
-    /// Refused while first-write tracking is active. The device maps the range again with full
-    /// access, which would remove the write protection that the tracker put on clean pages, and
-    /// later guest writes would not be recorded.
-    pub fn unmap_ram(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
-        debug!("unmap_ram: guest_addr={guest_addr:x}, len={len}");
-        let ok = if self.dirty_tracker.active.load(Ordering::Acquire) {
-            false
-        } else if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
-            error!("Error unmapping hot-plugged RAM: {e:?}");
-            false
-        } else {
-            true
-        };
-        reply_sender.send(ok).unwrap();
+    /// The mapper that the virtio-mem device uses for its hot-plugged RAM.
+    pub fn ram_mapper(&self) -> Box<dyn devices::virtio::RamMapper> {
+        Box::new(HvfRamMapper {
+            dirty_tracker: Arc::clone(&self.dirty_tracker),
+        })
     }
 
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
@@ -344,6 +320,35 @@ impl Vm {
         } else {
             reply_sender.send(true).unwrap();
         }
+    }
+}
+
+/// Maps and unmaps hot-plugged RAM for the virtio-mem device.
+///
+/// The device calls it on its own thread with the device lock held. It takes no lock of the VMM,
+/// so it cannot wait for a thread that waits for the device.
+struct HvfRamMapper {
+    dirty_tracker: Arc<HvfDirtyTracker>,
+}
+
+impl devices::virtio::RamMapper for HvfRamMapper {
+    fn map(&self, host_addr: u64, guest_addr: u64, len: u64) -> io::Result<()> {
+        debug!("map hot-plugged RAM: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+        hvf::map_ram(host_addr, guest_addr, len).map_err(|e| io::Error::other(format!("{e:?}")))
+    }
+
+    /// Refused while first-write tracking is active. The device maps the range again with full
+    /// access, which would remove the write protection that the tracker put on clean pages, and
+    /// later guest writes would not be recorded.
+    fn unmap(&self, guest_addr: u64, len: u64) -> io::Result<()> {
+        debug!("unmap hot-plugged RAM: guest_addr={guest_addr:x}, len={len}");
+        if self.dirty_tracker.active.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "first-write tracking is active",
+            ));
+        }
+        hvf::unmap_ram(guest_addr, len).map_err(|e| io::Error::other(format!("{e:?}")))
     }
 }
 

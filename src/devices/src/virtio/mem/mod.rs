@@ -5,6 +5,22 @@ mod event_handler;
 
 pub use self::defs::uapi::VIRTIO_ID_MEM as TYPE_MEM;
 pub use self::device::{Mem, MemStateSnapshot, VIRTIO_MEM_BLOCK_SIZE};
+
+/// Changes the hypervisor mapping of hot-plugged RAM for the virtio-mem device on macOS and
+/// Windows.
+///
+/// The device calls it on its own thread with the device lock held. An implementation must not
+/// take a lock that a thread can hold while that thread waits for the device.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub trait RamMapper: Send {
+    /// Map a host range at a guest address with read, write, and execute access. On error no
+    /// part of the range is mapped.
+    fn map(&self, host_addr: u64, guest_addr: u64, len: u64) -> std::io::Result<()>;
+
+    /// Unmap a guest range, so that the device can release its host memory. On error the
+    /// range is still mapped.
+    fn unmap(&self, guest_addr: u64, len: u64) -> std::io::Result<()>;
+}
 #[cfg(any(test, feature = "test_utils"))]
 pub use self::device::harness::{fuzz_mem_requests, Harness as MemHarness};
 

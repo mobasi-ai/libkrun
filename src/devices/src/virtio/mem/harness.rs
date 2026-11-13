@@ -12,8 +12,8 @@
 //! - on Windows a block is committed only while it is plugged;
 //! - on Unix the host memory on each side of the hotplug region is not changed.
 //!
-//! A thread stands in for the VMM worker. It answers the map and unmap requests of the device,
-//! records what a hypervisor would map, and can refuse a request to inject a failure. The
+//! A stand-in takes the place of the hypervisor. It answers the map and unmap calls of the
+//! device, records what a hypervisor would map, and can refuse a call to inject a failure. The
 //! device makes the real host calls (`mmap`, `VirtualAlloc`, `VirtualFree`, `madvise`).
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -57,7 +57,7 @@ const GUARD_BYTE: u8 = 0xc3;
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
-/// What a hypervisor would map, as the stand-in for the VMM worker records it.
+/// What a hypervisor would map, as the stand-in records it.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 struct Hypervisor {
     mapped: Mutex<Vec<bool>>,
@@ -87,20 +87,6 @@ impl Hypervisor {
         }
         let first = ((guest_addr - BASE) / BLOCK) as usize;
         Some(first..first + (len / BLOCK) as usize)
-    }
-
-    fn serve(&self, message: WorkerMessage) {
-        match message {
-            WorkerMessage::RamMap(reply, host_addr, guest_addr, len) => {
-                let ok = self.map(host_addr, guest_addr, len);
-                let _ = reply.send(ok);
-            }
-            WorkerMessage::RamUnmap(reply, guest_addr, len) => {
-                let ok = self.unmap(guest_addr, len);
-                let _ = reply.send(ok);
-            }
-            _ => self.violation("a message that is not a RAM map or unmap".into()),
-        }
     }
 
     fn map(&self, host_addr: u64, guest_addr: u64, len: u64) -> bool {
@@ -149,6 +135,29 @@ impl Hypervisor {
             mapped[block] = false;
         }
         true
+    }
+}
+
+/// The mapper that the device gets: the stand-in for the hypervisor.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+struct StandInMapper(Arc<Hypervisor>);
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl RamMapper for StandInMapper {
+    fn map(&self, host_addr: u64, guest_addr: u64, len: u64) -> io::Result<()> {
+        if self.0.map(host_addr, guest_addr, len) {
+            Ok(())
+        } else {
+            Err(io::Error::other("the stand-in refused the map"))
+        }
+    }
+
+    fn unmap(&self, guest_addr: u64, len: u64) -> io::Result<()> {
+        if self.0.unmap(guest_addr, len) {
+            Ok(())
+        } else {
+            Err(io::Error::other("the stand-in refused the unmap"))
+        }
     }
 }
 
@@ -219,6 +228,10 @@ pub struct Harness {
     tags: Vec<u64>,
     next_tag: u64,
     steps: u64,
+    /// The model: the driver acknowledged the features that the device offers.
+    features_acked: bool,
+    /// The model: Windows will refuse the commit of the next plug that reaches it.
+    commit_refused: bool,
     pub stats: Stats,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     hypervisor: Arc<Hypervisor>,
@@ -279,6 +292,7 @@ impl Harness {
 
         let mut device = Mem::new().unwrap();
         device.set_region(BASE, REGION).unwrap();
+        let acknowledge = |device: &mut Mem| device.acked_features = device.avail_features;
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let hypervisor = {
@@ -290,16 +304,12 @@ impl Harness {
                 refuse_next_map: AtomicBool::new(false),
                 host_base,
             });
-            let (sender, receiver) = crossbeam_channel::unbounded();
-            device.set_map_sender(sender);
-            let worker = hypervisor.clone();
-            std::thread::spawn(move || {
-                for message in receiver {
-                    worker.serve(message);
-                }
-            });
+            device.set_ram_mapper(Box::new(StandInMapper(hypervisor.clone())));
             hypervisor
         };
+
+        // The harness activates the device directly, so it acknowledges the features here.
+        acknowledge(&mut device);
 
         Self {
             device,
@@ -311,6 +321,8 @@ impl Harness {
             tags: vec![0; BLOCKS],
             next_tag: 0x5eed_0000_0000_0001,
             steps: 0,
+            features_acked: true,
+            commit_refused: false,
             stats: Stats::default(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             hypervisor,
@@ -365,6 +377,18 @@ impl Harness {
     pub fn refuse_next_map(&mut self) {
         #[cfg(target_os = "windows")]
         self.hypervisor.refuse_next_map.store(true, Ordering::SeqCst);
+    }
+
+    /// Act as a driver that acknowledged no feature of the device.
+    pub fn forget_features(&mut self) {
+        self.device.acked_features = 0;
+        self.features_acked = false;
+    }
+
+    /// Tell the model that Windows will refuse the commit of the next plug that reaches it. The
+    /// test must make Windows do so, for example with a job memory limit.
+    pub fn expect_refused_commit(&mut self) {
+        self.commit_refused = true;
     }
 
     /// Guest request with valid descriptors and any address. Returns the response type.
@@ -469,7 +493,11 @@ impl Harness {
                 {
                     return (VIRTIO_MEM_RESP_NACK, 0);
                 }
-                if self.take_map_refusal() {
+                // Windows gives no memory to a driver that can read unplugged memory.
+                if cfg!(target_os = "windows") && !self.features_acked {
+                    return (VIRTIO_MEM_RESP_ERROR, 0);
+                }
+                if std::mem::take(&mut self.commit_refused) || self.take_map_refusal() {
                     return (VIRTIO_MEM_RESP_BUSY, 0);
                 }
                 self.plugged[blocks].fill(true);

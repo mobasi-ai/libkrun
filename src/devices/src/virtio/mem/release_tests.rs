@@ -263,6 +263,86 @@ fn a_refused_map_leaves_the_range_reserved() {
     harness.finish();
 }
 
+/// Put this process in a job with a memory limit, or change the limit of that job.
+#[cfg(target_os = "windows")]
+fn limit_process_commit(job: &mut isize, bytes: usize) {
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: plain calls with valid arguments; an all-zero limit structure is a valid value.
+    unsafe {
+        let first = *job == 0;
+        if first {
+            *job = CreateJobObjectW(std::ptr::null(), std::ptr::null()) as isize;
+            assert_ne!(*job, 0);
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        limits.ProcessMemoryLimit = bytes;
+        assert_ne!(
+            SetInformationJobObject(
+                *job as _,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ),
+            0
+        );
+        if first {
+            assert_ne!(AssignProcessToJobObject(*job as _, GetCurrentProcess()), 0);
+        }
+    }
+}
+
+/// Windows refuses a commit when the commit limit is reached (error 1455). A job memory limit
+/// makes the same refusal for this process only. The guest must get BUSY, and no part of the
+/// range can stay committed or mapped: the harness checks both after each request.
+#[cfg(target_os = "windows")]
+#[test]
+fn a_commit_that_windows_refuses_answers_busy_and_changes_nothing() {
+    alone("a_commit_that_windows_refuses_answers_busy_and_changes_nothing", || {
+        let mut harness = Harness::new();
+        harness.set_requested(BLOCKS);
+        assert_eq!(harness.plug(0, 1), VIRTIO_MEM_RESP_ACK);
+        let mut job = 0;
+
+        // Less than the reserve of 512 MiB is left: the commit succeeds, the check of the
+        // reserve fails, and the commit goes back.
+        limit_process_commit(&mut job, process_commit() + (300 << 20));
+        harness.expect_refused_commit();
+        assert_eq!(harness.plug(1, 8), VIRTIO_MEM_RESP_BUSY);
+
+        // Less than the range is left: Windows refuses the commit itself.
+        limit_process_commit(&mut job, process_commit() + (8 << 20));
+        harness.expect_refused_commit();
+        assert_eq!(harness.plug(1, 16), VIRTIO_MEM_RESP_BUSY);
+
+        // The block that was plugged before keeps its data, and an unplug still works.
+        assert_eq!(harness.unplug(0, 1), VIRTIO_MEM_RESP_ACK);
+
+        // With commit available again, the same plug succeeds.
+        limit_process_commit(&mut job, process_commit() + (2048 << 20));
+        assert_eq!(harness.plug(1, 16), VIRTIO_MEM_RESP_ACK);
+        harness.finish();
+    });
+}
+
+/// A driver that did not acknowledge VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE can read unplugged
+/// memory, which stops the VM on Windows. The device gives such a driver no memory.
+#[cfg(target_os = "windows")]
+#[test]
+fn a_driver_that_can_read_unplugged_memory_gets_no_memory() {
+    let mut harness = Harness::new();
+    harness.set_requested(BLOCKS);
+    harness.forget_features();
+    assert_eq!(harness.plug(0, 1), VIRTIO_MEM_RESP_ERROR);
+    assert!(harness.plugged().iter().all(|plugged| !*plugged));
+    harness.finish();
+}
+
 /// Host threads of other devices hold pointers into guest memory. On Unix a thread that reads
 /// or writes a range while the device releases it must find memory there: the old pages or the
 /// new zero pages.

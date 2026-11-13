@@ -22,6 +22,7 @@ const LOW: usize = 1 << 20;
 
 struct Machine {
     vm: Vm,
+    mapper: Box<dyn devices::virtio::RamMapper>,
     host: u64,
     _memory: GuestMemoryMmap,
 }
@@ -44,8 +45,10 @@ fn machine() -> Option<Machine> {
         ))
         .unwrap();
     vm.memory_init(&memory).unwrap();
+    let mapper = vm.ram_mapper().expect("a reserved region gives a mapper");
     Some(Machine {
         vm,
+        mapper,
         host,
         _memory: memory,
     })
@@ -66,20 +69,19 @@ impl Machine {
     }
 
     fn map(&self, block: u64, blocks: u64) -> bool {
-        let (reply, answer) = bounded(1);
-        self.vm.map_ram(
-            reply,
-            self.host + block * BLOCK,
-            BASE + block * BLOCK,
-            blocks * BLOCK,
-        );
-        answer.recv().unwrap()
+        self.mapper
+            .map(
+                self.host + block * BLOCK,
+                BASE + block * BLOCK,
+                blocks * BLOCK,
+            )
+            .is_ok()
     }
 
     fn unmap(&self, block: u64, blocks: u64) -> bool {
-        let (reply, answer) = bounded(1);
-        self.vm.unmap_ram(reply, BASE + block * BLOCK, blocks * BLOCK);
-        answer.recv().unwrap()
+        self.mapper
+            .unmap(BASE + block * BLOCK, blocks * BLOCK)
+            .is_ok()
     }
 
     fn state(&self, block: u64) -> u32 {
