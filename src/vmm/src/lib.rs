@@ -2107,6 +2107,16 @@ impl Vmm {
     }
 
     fn require_paused_memory_boundary(&self) -> Result<PauseGeneration> {
+        // Windows commits a virtio-mem range only while the guest has it plugged, and maps it
+        // outside the regions that dirty tracking knows. Memory capture and restore read, write,
+        // and track all of guest memory, so they are refused for such a VM.
+        #[cfg(target_os = "windows")]
+        if self.vm.has_reserved_ram() {
+            return Err(Error::DeviceState(
+                "memory capture and restore do not support a virtio-mem hotplug region on Windows"
+                    .into(),
+            ));
+        }
         match self.execution_state {
             VmmExecutionState::Paused(generation) => Ok(generation),
             VmmExecutionState::Running { .. } | VmmExecutionState::Indeterminate => {
@@ -2343,6 +2353,12 @@ impl Vmm {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn map_ram(&self, reply_sender: Sender<bool>, host_addr: u64, guest_addr: u64, len: u64) {
         self.vm.map_ram(reply_sender, host_addr, guest_addr, len);
+    }
+
+    /// Unmap hot-plugged guest RAM so that the host can release its memory.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub fn unmap_ram(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        self.vm.unmap_ram(reply_sender, guest_addr, len);
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]

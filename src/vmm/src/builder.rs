@@ -4766,8 +4766,16 @@ fn attach_mem_device(
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    // With the channel, the device gives the host memory of unplugged ranges back. On Windows it
+    // then commits and maps each range on plug, so the region must be only reserved at boot. A
+    // region that was committed and mapped at boot (NUMA placement, private memory) keeps the
+    // upstream behavior.
+    #[cfg(target_os = "macos")]
     mem_device.lock().unwrap().set_map_sender(map_sender);
+    #[cfg(target_os = "windows")]
+    if vmm.vm.has_reserved_ram() {
+        mem_device.lock().unwrap().set_map_sender(map_sender);
+    }
 
     event_manager
         .add_subscriber(mem_device.clone())

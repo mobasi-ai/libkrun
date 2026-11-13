@@ -12,6 +12,8 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, HostMemoryRange, MemError,
     QueueConfig, VirtioDevice, VirtioStateError,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use super::backing::{self, HostRange};
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 
@@ -42,6 +44,10 @@ const VIRTIO_MEM_STATE_UNPLUGGED: u16 = 1;
 const VIRTIO_MEM_STATE_MIXED: u16 = 2;
 
 pub(crate) const BASE_AVAIL_FEATURES: u64 = 1 << uapi::VIRTIO_F_VERSION_1 as u64;
+
+/// The guest must not read unplugged memory.
+#[cfg(target_os = "windows")]
+const VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE: u64 = 1;
 
 const MEM_STATE_MAGIC: &[u8; 8] = b"MSBKMEM\0";
 // Schema 1 did not guarantee that acknowledged unplugged memory reads as zero.
@@ -138,8 +144,17 @@ impl Mem {
     }
 
     /// Give the device the channel to the VMM worker for RAM map and unmap requests.
+    ///
+    /// With the channel, the device gives the host memory of unplugged ranges back. On Windows
+    /// the hotplug region must then be only reserved at boot, and not mapped.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn set_map_sender(&mut self, sender: crossbeam_channel::Sender<WorkerMessage>) {
+        // Windows decommits an unplugged range, so a guest that reads it stops. The Linux driver
+        // acknowledges this feature and then does not touch unplugged memory.
+        #[cfg(target_os = "windows")]
+        {
+            self.avail_features |= 1 << VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE;
+        }
         self.map_sender = Some(sender);
     }
 
@@ -304,21 +319,18 @@ impl Mem {
         {
             return resp(VIRTIO_MEM_RESP_NACK, 0);
         }
-        // Give the block host memory before the guest may use it. A host that cannot commit the
-        // memory now (Windows error 1455, or too little headroom) answers BUSY; the guest keeps
-        // its current size and asks again after a delay.
-        if let Err(error) = self.back_range(addr, add) {
-            warn!("virtio-mem: cannot back {add} plugged bytes at 0x{addr:x}: {error}");
-            return resp(VIRTIO_MEM_RESP_BUSY, 0);
-        }
         // Ownership transitions are changes even if the guest has not written the newly plugged
         // pages. Mark before publishing the bitmap so incremental capture cannot inherit stale RAM.
         if let Err(error) = self.mark_transition(addr, add) {
             error!("virtio-mem: cannot track plug: {error}");
-            if let Err(error) = self.release_backing(addr, add) {
-                error!("virtio-mem: cannot release the backing of a refused plug: {error}");
-            }
             return resp(VIRTIO_MEM_RESP_ERROR, 0);
+        }
+        // Give the range host memory before the guest may use it. A host that cannot do this now
+        // (Windows error 1455, or too little commit headroom) answers BUSY: the guest keeps its
+        // size and asks again after a delay. ERROR would make the Linux driver stop for good.
+        if let Err(error) = self.back_range(addr, add) {
+            warn!("virtio-mem: cannot back {add} plugged bytes at 0x{addr:x}: {error}");
+            return resp(VIRTIO_MEM_RESP_BUSY, 0);
         }
         for block in &mut self.plugged_blocks[range] {
             *block = true;
@@ -335,9 +347,8 @@ impl Mem {
             return resp(VIRTIO_MEM_RESP_NACK, 0);
         }
         let length = nb_blocks as u64 * VIRTIO_MEM_BLOCK_SIZE;
-        if let Err(error) = self.discard_range(addr, length) {
-            error!("virtio-mem: cannot zero unplugged range: {error}");
-            return resp(VIRTIO_MEM_RESP_ERROR, 0);
+        if let Err(refusal) = self.discard_range(addr, length) {
+            return resp(refusal, 0);
         }
         // ACK and ownership change form the commit point. A failed discard must leave the
         // bitmap/count plugged, and any partial write remains covered by mark-before-write.
@@ -349,16 +360,18 @@ impl Mem {
     }
 
     fn handle_unplug_all(&mut self) -> VirtioMemResp {
-        // Never touch untouched capacity merely because UNPLUG_ALL was requested. Disjoint
-        // occupied runs are all zeroed successfully before publishing any ownership change.
-        for range in self.block_runs(true) {
-            if let Err(error) = self.discard_range(range.start, range.length) {
-                error!("virtio-mem: cannot zero all unplugged ranges: {error}");
-                return resp(VIRTIO_MEM_RESP_ERROR, 0);
+        // Never touch untouched capacity merely because UNPLUG_ALL was requested. Each occupied
+        // run changes owner as soon as it is released, so a later failure leaves the bitmap equal
+        // to what the host backs: a released run is unplugged, and the other runs are plugged.
+        for run in self.block_runs(true) {
+            if let Err(refusal) = self.discard_range(run.start, run.length) {
+                return resp(refusal, 0);
             }
+            let first = ((run.start - self.config.addr) / VIRTIO_MEM_BLOCK_SIZE) as usize;
+            let count = (run.length / VIRTIO_MEM_BLOCK_SIZE) as usize;
+            self.plugged_blocks[first..first + count].fill(false);
+            self.config.plugged_size -= run.length;
         }
-        self.plugged_blocks.fill(false);
-        self.config.plugged_size = 0;
         resp(VIRTIO_MEM_RESP_ACK, 0)
     }
 
@@ -400,12 +413,23 @@ impl Mem {
     /// Guarantee zero-on-reuse and give the host memory of an unplugged range back.
     ///
     /// Linux drops the pages (`MADV_DONTNEED`), which also zeroes them. macOS and Windows
-    /// first unmap the range from the hypervisor, then release it: macOS replaces it with
-    /// fresh anonymous pages and maps it again; Windows decommits it, which also returns
-    /// its commit, and maps it again only on the next plug.
-    fn discard_range(&self, guest_addr: u64, len: u64) -> io::Result<()> {
-        self.mark_transition(guest_addr, len)?;
-        self.release_backing(guest_addr, len)
+    /// release the range through [`backing`]. On failure the range is unchanged and still
+    /// plugged, and the error is the response type for the guest.
+    fn discard_range(&self, guest_addr: u64, len: u64) -> Result<(), u16> {
+        if let Err(error) = self.mark_transition(guest_addr, len) {
+            error!("virtio-mem: cannot track unplug: {error}");
+            return Err(VIRTIO_MEM_RESP_ERROR);
+        }
+        if let Err(error) = self.release_backing(guest_addr, len) {
+            error!("virtio-mem: cannot release unplugged range: {error}");
+            // BUSY when the host could not do it now and the guest can ask again.
+            return Err(if error.kind() == io::ErrorKind::ResourceBusy {
+                VIRTIO_MEM_RESP_BUSY
+            } else {
+                VIRTIO_MEM_RESP_ERROR
+            });
+        }
+        Ok(())
     }
 
     fn guest_memory(&self) -> io::Result<&GuestMemoryMmap> {
@@ -416,13 +440,14 @@ impl Mem {
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn host_range(&self, guest_addr: u64, len: u64) -> io::Result<*mut u8> {
-        let memory = self.guest_memory()?;
-        let len = usize::try_from(len).map_err(|_| io::Error::other("range exceeds host address space"))?;
-        if !memory.check_range(GuestAddress(guest_addr), len) {
-            return Err(io::Error::other("virtio-mem range is not mapped RAM"));
-        }
-        memory.get_host_address(GuestAddress(guest_addr)).map_err(io::Error::other)
+    fn host_range(&self, guest_addr: u64, len: u64) -> io::Result<HostRange> {
+        HostRange::resolve(
+            self.guest_memory()?,
+            self.config.addr,
+            self.config.region_size,
+            guest_addr,
+            len,
+        )
     }
 
     /// Ask the VMM worker to change a hypervisor mapping and wait for its answer.
@@ -447,31 +472,28 @@ impl Mem {
         }
     }
 
-    /// Give a range that the guest plugs its host memory.
+    /// Give a range that the guest plugs its host memory. On failure nothing changed.
     #[cfg(target_os = "windows")]
     fn back_range(&self, guest_addr: u64, len: u64) -> io::Result<()> {
         if self.map_sender.is_none() {
+            // The hotplug region was committed and mapped at boot.
             return Ok(());
         }
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE};
-        let host = self.host_range(guest_addr, len)?;
-        // SAFETY: the range lies inside the reserved hotplug region of this process.
-        let committed = unsafe { VirtualAlloc(host.cast(), len as usize, MEM_COMMIT, PAGE_READWRITE) };
-        if committed.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // Commit first, so that Windows can grow a page file that it manages, then keep a
-        // reserve: a VMM whose own allocations fail aborts and takes the guest with it.
-        if let Err(error) = windows_commit_headroom() {
-            // SAFETY: the range was committed above and is not mapped into the partition.
-            unsafe { VirtualFree(host.cast(), len as usize, MEM_DECOMMIT) };
-            return Err(error);
-        }
-        if let Err(error) = self.vmm_request("map plugged RAM", |reply| {
-            WorkerMessage::RamMap(reply, host as u64, guest_addr, len)
-        }) {
-            // SAFETY: the range was committed above and is not mapped into the partition.
-            unsafe { VirtualFree(host.cast(), len as usize, MEM_DECOMMIT) };
+        let range = self.host_range(guest_addr, len)?;
+        backing::commit(&range)?;
+        // Commit first, so that Windows can grow a page file that it manages. Then keep a
+        // reserve for the VMM, and map the range.
+        let mapped = backing::commit_headroom().and_then(|()| {
+            self.vmm_request("map plugged RAM", |reply| {
+                WorkerMessage::RamMap(reply, range.host_addr(), range.guest_addr(), range.len())
+            })
+        });
+        if let Err(error) = mapped {
+            // The VMM leaves nothing mapped when a map fails, so the commit can go back. A
+            // range that stays committed costs commit and nothing else: the guest cannot reach it.
+            if let Err(error) = backing::decommit(&range) {
+                warn!("virtio-mem: cannot decommit a range that was not plugged: {error}");
+            }
             return Err(error);
         }
         Ok(())
@@ -483,61 +505,67 @@ impl Mem {
         Ok(())
     }
 
-    /// Give the host memory of a range back and leave it reading as zero.
+    /// Give the host memory of a range back and leave it reading as zero. On failure nothing
+    /// changed.
     #[cfg(target_os = "windows")]
     fn release_backing(&self, guest_addr: u64, len: u64) -> io::Result<()> {
         if self.map_sender.is_none() {
-            // No VMM worker (a unit test or an embedder without one): keep the old behavior.
+            // The hotplug region stays committed and mapped: keep the bounded writes.
             return zero_guest_range(self.guest_memory()?, guest_addr, len);
         }
-        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_DECOMMIT};
-        let host = self.host_range(guest_addr, len)?;
+        let busy = |error: io::Error| io::Error::new(io::ErrorKind::ResourceBusy, error);
+        let range = self.host_range(guest_addr, len).map_err(busy)?;
+        // Unmap first: the partition must not keep a range that the host takes back.
         self.vmm_request("unmap unplugged RAM", |reply| {
-            WorkerMessage::RamUnmap(reply, guest_addr, len)
-        })?;
-        // SAFETY: the range lies inside the hotplug region and the partition no longer maps it.
-        // A later commit gives zero pages.
-        if unsafe { VirtualFree(host.cast(), len as usize, MEM_DECOMMIT) } == 0 {
-            return Err(io::Error::last_os_error());
+            WorkerMessage::RamUnmap(reply, range.guest_addr(), range.len())
+        })
+        .map_err(busy)?;
+        if let Err(error) = backing::decommit(&range) {
+            // The guest still owns the range and can no longer reach it.
+            backing::fail_stop("decommit an unmapped range", &error);
         }
         Ok(())
     }
 
     #[cfg(target_os = "macos")]
     fn release_backing(&self, guest_addr: u64, len: u64) -> io::Result<()> {
-        if self.map_sender.is_none() {
-            // No VMM worker (a unit test or an embedder without one): keep the old behavior.
-            return zero_guest_range(self.guest_memory()?, guest_addr, len);
-        }
-        let host = self.host_range(guest_addr, len)?;
-        self.vmm_request("unmap unplugged RAM", |reply| {
-            WorkerMessage::RamUnmap(reply, guest_addr, len)
-        })?;
-        // SAFETY: the range lies inside the anonymous hotplug mapping and the hypervisor no
-        // longer maps it. MAP_FIXED replaces its pages with new zero-fill pages, which frees
-        // the old ones at once.
-        let replaced = unsafe {
-            libc::mmap(
-                host.cast(),
-                len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
+        let memory = self.guest_memory()?;
+        // Without a VMM worker, or when the hotplug region is not plain anonymous memory, keep
+        // the bounded writes.
+        let range = match (self.map_sender.is_some(), self.host_range(guest_addr, len)) {
+            (true, Ok(range)) => range,
+            _ => return zero_guest_range(memory, guest_addr, len),
         };
-        if replaced == libc::MAP_FAILED || replaced != host.cast() {
-            return Err(io::Error::last_os_error());
+        // The VMM refuses the unmap while it tracks first writes, because a new mapping would
+        // lose the write protection of the tracker. Nothing changed, so zero the range in place.
+        if let Err(error) = self.vmm_request("unmap unplugged RAM", |reply| {
+            WorkerMessage::RamUnmap(reply, range.guest_addr(), range.len())
+        }) {
+            debug!("virtio-mem: zero 0x{guest_addr:x} in place: {error}");
+            return zero_guest_range(memory, guest_addr, len);
         }
-        self.vmm_request("map unplugged RAM again", |reply| {
-            WorkerMessage::RamMap(reply, host as u64, guest_addr, len)
-        })
+        let replaced = backing::replace_with_zero_pages(&range);
+        // Map the range again in both cases. It holds the new pages or, after a failure, the old
+        // pages, and the guest must always find memory there.
+        if let Err(error) = self.vmm_request("map unplugged RAM again", |reply| {
+            WorkerMessage::RamMap(reply, range.host_addr(), range.guest_addr(), range.len())
+        }) {
+            backing::fail_stop("map an unplugged range again", &error);
+        }
+        match replaced {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                warn!("virtio-mem: cannot replace the pages at 0x{guest_addr:x}: {error}");
+                zero_guest_range(memory, guest_addr, len)
+            }
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn release_backing(&self, guest_addr: u64, len: u64) -> io::Result<()> {
         zero_guest_range(self.guest_memory()?, guest_addr, len)
     }
+
 
     pub fn process_req_queue(&mut self) -> bool {
         let mem = match self.device_state {
@@ -601,62 +629,6 @@ impl Mem {
 
         have_used
     }
-}
-
-/// Commit that the VMM process keeps free for its own allocations after a plug.
-#[cfg(target_os = "windows")]
-const WINDOWS_COMMIT_RESERVE: u64 = 512 << 20;
-
-/// Fail when less than [`WINDOWS_COMMIT_RESERVE`] of commit is left, for the whole system (RAM
-/// plus page file) or under the per-process memory limit of the job that holds this process.
-#[cfg(target_os = "windows")]
-fn windows_commit_headroom() -> io::Result<()> {
-    use windows_sys::Win32::System::JobObjects::{
-        JobObjectExtendedLimitInformation, QueryInformationJobObject,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    };
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    // SAFETY: `status` is sized and its length field is set, as the call requires.
-    if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullAvailPageFile < WINDOWS_COMMIT_RESERVE {
-        return Err(io::Error::other(format!(
-            "only {} MiB of system commit would be left",
-            status.ullAvailPageFile >> 20
-        )));
-    }
-
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a null job handle asks for the job of this process; the buffer has the size given.
-    let in_job = unsafe {
-        QueryInformationJobObject(
-            std::ptr::null_mut(),
-            JobObjectExtendedLimitInformation,
-            (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            std::ptr::null_mut(),
-        )
-    } != 0;
-    if in_job && limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0 {
-        let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
-        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        // SAFETY: `counters` is sized and its size field is set, as the call requires.
-        let ok = unsafe {
-            GetProcessMemoryInfo(GetCurrentProcess(), (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast(), counters.cb)
-        } != 0;
-        let limit = limits.ProcessMemoryLimit as u64;
-        let used = counters.PrivateUsage as u64;
-        if ok && limit.saturating_sub(used) < WINDOWS_COMMIT_RESERVE {
-            return Err(io::Error::other(format!(
-                "only {} MiB would be left under the job memory limit",
-                limit.saturating_sub(used) >> 20
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn resp(resp_type: u16, state: u16) -> VirtioMemResp {
@@ -868,6 +840,14 @@ impl VirtioDevice for Mem {
         Ok(())
     }
 }
+
+#[cfg(any(test, feature = "test_utils"))]
+#[path = "harness.rs"]
+pub mod harness;
+
+#[cfg(test)]
+#[path = "release_tests.rs"]
+mod release_tests;
 
 #[cfg(test)]
 mod checkpoint_tests {
@@ -1140,7 +1120,7 @@ mod checkpoint_tests {
     }
 
     #[test]
-    fn failed_unplug_and_unplug_all_do_not_commit_ownership() {
+    fn failed_unplug_keeps_ownership_and_unplug_all_records_each_released_run() {
         let mut device = device(3);
         let base = device.config.addr;
         // The last plugged block has no mapping, injecting a real zeroing failure. UNPLUG_ALL
@@ -1176,15 +1156,19 @@ mod checkpoint_tests {
             ),
             VIRTIO_MEM_RESP_ERROR
         );
-        assert_eq!(device.capture_device_state().unwrap(), state);
+        // The first run was released before the second run failed. It changes owner at once, so
+        // that the bitmap always equals what the host backs. The failed run stays plugged.
+        assert_eq!(device.plugged_blocks, [false, false, true]);
+        assert_eq!(device.state_snapshot().plugged_size, VIRTIO_MEM_BLOCK_SIZE);
         assert_eq!(memory.read_obj::<u64>(GuestAddress(base)).unwrap(), 0);
 
-        // A later valid unplug still succeeds; the failed attempt did not lose occupancy.
+        // The released run can be plugged again, and it is still zero.
         assert_eq!(
-            request(&mut device, &memory, &domain, VIRTIO_MEM_REQ_UNPLUG, 0, 1),
+            request(&mut device, &memory, &domain, VIRTIO_MEM_REQ_PLUG, 0, 1),
             VIRTIO_MEM_RESP_ACK
         );
-        assert_eq!(device.plugged_blocks, [false, false, true]);
+        assert_eq!(memory.read_obj::<u64>(GuestAddress(base)).unwrap(), 0);
+        assert_eq!(device.plugged_blocks, [true, false, true]);
     }
 
     #[test]

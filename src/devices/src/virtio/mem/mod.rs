@@ -1,8 +1,12 @@
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod backing;
 mod device;
 mod event_handler;
 
 pub use self::defs::uapi::VIRTIO_ID_MEM as TYPE_MEM;
 pub use self::device::{Mem, MemStateSnapshot, VIRTIO_MEM_BLOCK_SIZE};
+#[cfg(any(test, feature = "test_utils"))]
+pub use self::device::harness::{fuzz_mem_requests, Harness as MemHarness};
 
 mod defs {
     use super::super::QueueConfig;

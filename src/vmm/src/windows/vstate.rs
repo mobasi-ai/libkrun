@@ -26,6 +26,9 @@ use utils::{eventfd::EventFd, metrics::MetricsWriter};
 #[cfg(target_arch = "x86_64")]
 use vm_memory::Bytes;
 use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use windows_sys::Win32::System::Memory::{
+    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_RESERVE,
+};
 use windows_sys::Win32::Foundation::FILETIME;
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::Foundation::{E_FAIL, E_INVALIDARG, S_OK};
@@ -600,6 +603,8 @@ pub struct WhpCapabilities {
 pub struct Vm {
     partition: Partition,
     memory_regions: Vec<MappedMemoryRegion>,
+    /// True when a region of guest memory was only reserved at boot (virtio-mem hotplug RAM).
+    reserved_ram: bool,
     dirty_tracking: bool,
     dirty_tracking_transition_incomplete: bool,
     #[cfg(target_arch = "aarch64")]
@@ -1021,6 +1026,7 @@ impl Vm {
         Ok(Self {
             partition,
             memory_regions: Vec::new(),
+            reserved_ram: false,
             dirty_tracking: false,
             dirty_tracking_transition_incomplete: false,
             #[cfg(target_arch = "aarch64")]
@@ -1041,8 +1047,9 @@ impl Vm {
                 .map_err(Error::GuestMemoryHostAddress)?;
             // A virtio-mem hotplug region is only reserved at boot, so that it costs no commit.
             // The device commits and maps each block when the guest plugs it.
-            if is_reserved_only(host_addr.cast_const()) {
+            if host_page_state(host_addr.cast_const()) == MEM_RESERVE {
                 debug!("WHP: guest_addr=0x{guest_addr:x} size=0x{size:x} is reserved; mapped on plug");
+                self.reserved_ram = true;
                 continue;
             }
 
@@ -1062,10 +1069,22 @@ impl Vm {
         Ok(())
     }
 
+    /// True when a region of guest memory was only reserved at boot. The virtio-mem device
+    /// commits and maps its ranges when the guest plugs them.
+    pub fn has_reserved_ram(&self) -> bool {
+        self.reserved_ram
+    }
+
     /// Starts a WHP CPU dirty generation for every ordinary guest-memory mapping.
     ///
     /// The caller must hold the VM-wide paused boundary while mappings are replaced.
     pub fn begin_dirty_tracking(&mut self) -> Result<()> {
+        // Hot-plugged ranges are mapped outside `memory_regions`, so their writes would be lost.
+        if self.reserved_ram {
+            return Err(Error::NotImplemented(
+                "dirty tracking with a virtio-mem hotplug region",
+            ));
+        }
         self.set_dirty_tracking(true)
     }
 
@@ -1385,6 +1404,21 @@ impl Vm {
     pub fn map_ram(&self, reply_sender: Sender<bool>, host_addr: u64, guest_addr: u64, len: u64) {
         debug!("map_ram: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
         let ok = match map_gpa_range(self.partition.handle, host_addr as *const u8, guest_addr, len) {
+            Ok(()) => true,
+            Err(err) => {
+                error!("{err}");
+                // The device decommits the range after a failed map. Leave no part of it mapped.
+                let _ = unmap_gpa_range(self.partition.handle, guest_addr, len);
+                false
+            }
+        };
+        reply_sender.send(ok).unwrap();
+    }
+
+    /// Unmap hot-plugged guest RAM so that the device can decommit its host memory.
+    pub fn unmap_ram(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        debug!("unmap_ram: guest_addr={guest_addr:x}, len={len}");
+        let ok = match unmap_gpa_range(self.partition.handle, guest_addr, len) {
             Ok(()) => true,
             Err(err) => {
                 error!("{err}");
@@ -2430,15 +2464,34 @@ fn bitmap_to_ranges(
     }
 }
 
-/// True when the first page at `addr` is reserved but not committed.
-fn is_reserved_only(addr: *const u8) -> bool {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_RESERVE};
+/// The state of the page at `addr`: `MEM_COMMIT`, `MEM_RESERVE`, or `MEM_FREE`. Zero when the
+/// query fails.
+fn host_page_state(addr: *const u8) -> u32 {
+    // SAFETY: an all-zero MEMORY_BASIC_INFORMATION is a valid value.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a valid out buffer of the size that the call is given.
     let written = unsafe {
         VirtualQuery(addr.cast(), &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>())
     };
-    written != 0 && info.State == MEM_RESERVE
+    if written == 0 {
+        0
+    } else {
+        info.State
+    }
+}
+
+/// True when the host memory of a guest access is committed.
+///
+/// A virtio-mem range that the guest does not have plugged is in guest memory but has no host
+/// memory. A guest that touches it gets a memory access exit, and the access must fail here:
+/// a host read or write of the range would end the VMM with an access violation.
+fn guest_access_is_backed(guest_mem: &GuestMemoryMmap, guest_addr: u64, len: usize) -> bool {
+    let last = guest_addr.saturating_add(len.saturating_sub(1) as u64);
+    [guest_addr, last].into_iter().all(|addr| {
+        guest_mem
+            .get_host_address(GuestAddress(addr))
+            .is_ok_and(|host| host_page_state(host.cast_const()) == MEM_COMMIT)
+    })
 }
 
 fn unmap_gpa_range(partition: WHV_PARTITION_HANDLE, guest_addr: u64, size: u64) -> Result<()> {
@@ -3873,6 +3926,13 @@ unsafe extern "system" fn emulator_memory_callback(
                 }
             }
 
+            if !guest_access_is_backed(&context.guest_mem, memory_access.GpaAddress, len) {
+                error!(
+                    "WHP read of guest memory that is not plugged: vcpu={} gpa=0x{:x}",
+                    context.id, memory_access.GpaAddress
+                );
+                return E_FAIL;
+            }
             match context.guest_mem.read(
                 &mut memory_access.Data[..len],
                 GuestAddress(memory_access.GpaAddress),
@@ -3895,6 +3955,13 @@ unsafe extern "system" fn emulator_memory_callback(
                 }
             }
 
+            if !guest_access_is_backed(&context.guest_mem, memory_access.GpaAddress, len) {
+                error!(
+                    "WHP write of guest memory that is not plugged: vcpu={} gpa=0x{:x}",
+                    context.id, memory_access.GpaAddress
+                );
+                return E_FAIL;
+            }
             match context
                 .guest_mem
                 .write(data, GuestAddress(memory_access.GpaAddress))

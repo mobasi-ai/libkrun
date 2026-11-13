@@ -318,6 +318,24 @@ impl Vm {
         reply_sender.send(ok).unwrap();
     }
 
+    /// Unmap hot-plugged guest RAM so that the device can replace its host pages.
+    ///
+    /// Refused while first-write tracking is active. The device maps the range again with full
+    /// access, which would remove the write protection that the tracker put on clean pages, and
+    /// later guest writes would not be recorded.
+    pub fn unmap_ram(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        debug!("unmap_ram: guest_addr={guest_addr:x}, len={len}");
+        let ok = if self.dirty_tracker.active.load(Ordering::Acquire) {
+            false
+        } else if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
+            error!("Error unmapping hot-plugged RAM: {e:?}");
+            false
+        } else {
+            true
+        };
+        reply_sender.send(ok).unwrap();
+    }
+
     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
         debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
