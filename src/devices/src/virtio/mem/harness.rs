@@ -16,8 +16,11 @@
 //! records what a hypervisor would map, and can refuse a request to inject a failure. The
 //! device makes the real host calls (`mmap`, `VirtualAlloc`, `VirtualFree`, `madvise`).
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::sync::Mutex;
 
 use vm_memory::{GuestRegionMmap, MmapRegion};
 
