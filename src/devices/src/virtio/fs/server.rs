@@ -11,8 +11,6 @@ use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
-#[cfg(target_os = "windows")]
-use std::io::{Seek, SeekFrom};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -38,16 +36,8 @@ const DIRENT_PADDING: [u8; 8] = [0; 8];
 struct ZCReader<'a>(Reader<'a>);
 
 impl ZeroCopyReader for ZCReader<'_> {
-    #[cfg(not(target_os = "windows"))]
     fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
         self.0.read_to_at(f, count, off)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn read_to(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
-        let mut dst = f.try_clone()?;
-        dst.seek(SeekFrom::Start(off))?;
-        io::copy(&mut self.0.by_ref().take(count as u64), &mut dst).map(|count| count as usize)
     }
 }
 
@@ -60,16 +50,8 @@ impl io::Read for ZCReader<'_> {
 struct ZCWriter<'a>(Writer<'a>);
 
 impl ZeroCopyWriter for ZCWriter<'_> {
-    #[cfg(not(target_os = "windows"))]
     fn write_from(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
         self.0.write_from_at(f, count, off)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn write_from(&mut self, f: &File, count: usize, off: u64) -> io::Result<usize> {
-        let mut src = f.try_clone()?;
-        src.seek(SeekFrom::Start(off))?;
-        io::copy(&mut src.take(count as u64), &mut self.0).map(|count| count as usize)
     }
 }
 

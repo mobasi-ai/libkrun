@@ -425,6 +425,546 @@ macro_rules! volatile_impl {
 #[cfg(unix)]
 volatile_impl!(File);
 
+#[cfg(windows)]
+mod windows_file_io {
+    use std::cell::RefCell;
+    use std::fs::File;
+    use std::io::{Error, ErrorKind, Result};
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::{copy_nonoverlapping, null};
+
+    use vm_memory::VolatileSlice;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+    use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent};
+
+    use super::FileReadWriteAtVolatile;
+
+    const MAX_IO_BYTES: usize = u32::MAX as usize;
+    const MAX_RETAINED_STAGING_BYTES: usize = 1 << 20;
+
+    /// Thread-local manual-reset Win32 event so even a `FILE_FLAG_OVERLAPPED` handle
+    /// completes synchronously before stack `OVERLAPPED` and buffer guards are dropped.
+    struct ThreadEvent(HANDLE);
+
+    impl ThreadEvent {
+        fn new() -> Result<Self> {
+            // SAFETY: creates a private, unnamed, manual-reset, non-signaled Win32 event.
+            let handle = unsafe { CreateEventW(null(), 1, 0, null()) };
+            if handle.is_null() {
+                Err(Error::last_os_error())
+            } else {
+                Ok(Self(handle))
+            }
+        }
+
+        fn reset_raw(&self) -> Result<HANDLE> {
+            // SAFETY: `self.0` is a valid event handle owned by this thread-local.
+            if unsafe { ResetEvent(self.0) } == 0 {
+                return Err(Error::last_os_error());
+            }
+            Ok(self.0)
+        }
+    }
+
+    impl Drop for ThreadEvent {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is owned exclusively by this `ThreadEvent`.
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static STAGING: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        static IO_EVENT: RefCell<Option<ThreadEvent>> = const { RefCell::new(None) };
+    }
+
+    fn thread_io_event() -> Result<HANDLE> {
+        IO_EVENT.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(ThreadEvent::new()?);
+            }
+            slot.as_ref().expect("initialized thread event").reset_raw()
+        })
+    }
+
+    fn validate_offset(offset: u64, len: usize) -> Result<()> {
+        // Reject offsets above `i64::MAX` (matching Linux pread/pwrite `EINVAL`) and
+        // specifically excluding Windows `OVERLAPPED` sentinels `0xFFFF_FFFF_FFFF_FFFF`
+        // (append) and `0xFFFF_FFFF_FFFF_FFFE` (use current file pointer).
+        // Use `ErrorKind::InvalidInput` (not raw POSIX `EINVAL = 22`, which Windows
+        // interprets as `ERROR_BAD_COMMAND`) so host callers map it cleanly to `EINVAL`.
+        let max_pos = i64::MAX as u64;
+        if offset > max_pos
+            || offset
+                .checked_add(len as u64)
+                .is_none_or(|end| end > max_pos)
+        {
+            return Err(Error::new(ErrorKind::InvalidInput, "file offset out of range"));
+        }
+        Ok(())
+    }
+
+    fn overlapped_at(offset: u64, event: HANDLE) -> OVERLAPPED {
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.Anonymous.Anonymous.Offset = offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        overlapped.hEvent = event;
+        overlapped
+    }
+
+    fn finish_overlapped(
+        file: &File,
+        overlapped: &OVERLAPPED,
+        treat_eof_as_zero: bool,
+    ) -> Result<usize> {
+        let err = Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
+            let mut transferred: u32 = 0;
+            // SAFETY: `overlapped` and the I/O buffer remain live until `GetOverlappedResult`
+            // with `bWait = 1` returns, guaranteeing Windows no longer references them.
+            let done = unsafe {
+                GetOverlappedResult(file.as_raw_handle(), overlapped, &mut transferred, 1)
+            };
+            if done != 0 {
+                return Ok(transferred as usize);
+            }
+            let wait_err = Error::last_os_error();
+            if treat_eof_as_zero && wait_err.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+                return Ok(0);
+            }
+            return Err(wait_err);
+        }
+        if treat_eof_as_zero && err.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+            Ok(0)
+        } else {
+            Err(err)
+        }
+    }
+
+    fn read_raw_at(file: &File, ptr: *mut u8, len: usize, offset: u64) -> Result<usize> {
+        let to_read = len.min(MAX_IO_BYTES);
+        validate_offset(offset, to_read)?;
+        if to_read == 0 {
+            return Ok(0);
+        }
+        let event = thread_io_event()?;
+        let mut read_bytes: u32 = 0;
+        let mut overlapped = overlapped_at(offset, event);
+        // SAFETY: `ptr` is valid for `to_read` writable bytes and remains alive until
+        // `ReadFile` (and `GetOverlappedResult` if pending) completes.
+        let ok = unsafe {
+            ReadFile(
+                file.as_raw_handle(),
+                ptr,
+                to_read as u32,
+                &mut read_bytes,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            Ok(read_bytes as usize)
+        } else {
+            finish_overlapped(file, &overlapped, true)
+        }
+    }
+
+    fn write_raw_at(file: &File, ptr: *const u8, len: usize, offset: u64) -> Result<usize> {
+        let to_write = len.min(MAX_IO_BYTES);
+        validate_offset(offset, to_write)?;
+        if to_write == 0 {
+            return Ok(0);
+        }
+        let event = thread_io_event()?;
+        let mut written_bytes: u32 = 0;
+        let mut overlapped = overlapped_at(offset, event);
+        // SAFETY: `ptr` is valid for `to_write` readable bytes and remains alive until
+        // `WriteFile` (and `GetOverlappedResult` if pending) completes.
+        let ok = unsafe {
+            WriteFile(
+                file.as_raw_handle(),
+                ptr,
+                to_write as u32,
+                &mut written_bytes,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            Ok(written_bytes as usize)
+        } else {
+            finish_overlapped(file, &overlapped, false)
+        }
+    }
+
+    fn total_len(bufs: &[VolatileSlice]) -> Result<usize> {
+        bufs.iter().try_fold(0usize, |acc, s| {
+            acc.checked_add(s.len())
+                .ok_or_else(|| Error::new(ErrorKind::InvalidData, "slice length overflow"))
+        })
+    }
+
+    fn single_non_empty<'a>(bufs: &'a [VolatileSlice<'a>]) -> Option<VolatileSlice<'a>> {
+        let mut found = None;
+        for slice in bufs {
+            if slice.is_empty() {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(*slice);
+        }
+        found
+    }
+
+    fn trim_staging(staging: &mut Vec<u8>) {
+        if staging.capacity() > MAX_RETAINED_STAGING_BYTES {
+            staging.truncate(MAX_RETAINED_STAGING_BYTES);
+            staging.shrink_to_fit();
+        }
+    }
+
+    impl FileReadWriteAtVolatile for File {
+        fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
+            validate_offset(offset, slice.len())?;
+            if slice.is_empty() {
+                return Ok(0);
+            }
+            let guard = slice.ptr_guard_mut();
+            read_raw_at(self, guard.as_ptr(), guard.len(), offset)
+        }
+
+        fn read_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
+            let total = total_len(bufs)?;
+            validate_offset(offset, total.min(MAX_IO_BYTES))?;
+            if total == 0 {
+                return Ok(0);
+            }
+            // Fast zero-copy path when a single non-empty slice holds the whole request;
+            // never coalesce across independently backed slices by raw pointer adjacency.
+            if let Some(only) = single_non_empty(bufs) {
+                let guard = only.ptr_guard_mut();
+                return read_raw_at(self, guard.as_ptr(), guard.len(), offset);
+            }
+
+            let target_len = total.min(MAX_IO_BYTES);
+            STAGING.with(|cell| {
+                let mut staging = cell.borrow_mut();
+                if staging.len() < target_len {
+                    staging.resize(target_len, 0);
+                }
+                let result = read_raw_at(self, staging.as_mut_ptr(), target_len, offset).map(|n| {
+                    let mut copied = 0usize;
+                    for slice in bufs {
+                        let remaining = n - copied;
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = remaining.min(slice.len());
+                        if take > 0 {
+                            let guard = slice.ptr_guard_mut();
+                            // SAFETY: `staging` holds at least `n` initialized bytes and `guard`
+                            // is valid for `slice.len() >= take` writable bytes.
+                            unsafe {
+                                copy_nonoverlapping(
+                                    staging.as_ptr().add(copied),
+                                    guard.as_ptr(),
+                                    take,
+                                );
+                            }
+                            copied += take;
+                        }
+                    }
+                    copied
+                });
+                trim_staging(&mut staging);
+                result
+            })
+        }
+
+        fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {
+            validate_offset(offset, slice.len())?;
+            if slice.is_empty() {
+                return Ok(0);
+            }
+            let guard = slice.ptr_guard();
+            write_raw_at(self, guard.as_ptr(), guard.len(), offset)
+        }
+
+        fn write_vectored_at_volatile(&self, bufs: &[VolatileSlice], offset: u64) -> Result<usize> {
+            let total = total_len(bufs)?;
+            validate_offset(offset, total.min(MAX_IO_BYTES))?;
+            if total == 0 {
+                return Ok(0);
+            }
+            // Fast zero-copy path when a single non-empty slice holds the whole request.
+            if let Some(only) = single_non_empty(bufs) {
+                let guard = only.ptr_guard();
+                return write_raw_at(self, guard.as_ptr(), guard.len(), offset);
+            }
+
+            let target_len = total.min(MAX_IO_BYTES);
+            STAGING.with(|cell| {
+                let mut staging = cell.borrow_mut();
+                if staging.len() < target_len {
+                    staging.resize(target_len, 0);
+                }
+                let mut copied = 0usize;
+                for slice in bufs {
+                    let remaining = target_len - copied;
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = remaining.min(slice.len());
+                    if take > 0 {
+                        let guard = slice.ptr_guard();
+                        // SAFETY: `guard` is valid for `slice.len() >= take` readable bytes and
+                        // `staging` has capacity for `target_len >= copied + take` bytes.
+                        unsafe {
+                            copy_nonoverlapping(
+                                guard.as_ptr(),
+                                staging.as_mut_ptr().add(copied),
+                                take,
+                            );
+                        }
+                        copied += take;
+                    }
+                }
+                let result = write_raw_at(self, staging.as_ptr(), copied, offset);
+                trim_staging(&mut staging);
+                result
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Write};
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+
+        use super::*;
+
+        fn temp_path(name: &str) -> std::path::PathBuf {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::env::temp_dir().join(format!(
+                "libkrun-win-pos-io-{name}-{}-{ts}.bin",
+                std::process::id()
+            ))
+        }
+
+        #[test]
+        fn positional_read_write_scattered_slices_and_eof() {
+            let path = temp_path("scattered");
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+
+            // 128 KiB payload split across 32 non-contiguous 4 KiB guest pages (gaps between pages).
+            let pages = 32usize;
+            let page_size = 4096usize;
+            let stride = 8192usize;
+            let mem: GuestMemoryMmap<()> =
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), pages * stride * 2)]).unwrap();
+
+            let mut expected = vec![0u8; pages * page_size];
+            for (i, b) in expected.iter_mut().enumerate() {
+                *b = ((i * 37 + 11) & 0xFF) as u8;
+            }
+            let mut src_slices = Vec::with_capacity(pages);
+            for p in 0..pages {
+                let addr = GuestAddress((p * stride) as u64);
+                mem.write_slice(&expected[p * page_size..(p + 1) * page_size], addr)
+                    .unwrap();
+                src_slices.push(mem.get_slice(addr, page_size).unwrap());
+            }
+
+            // Positional write at non-zero offset (12345).
+            let off = 12_345u64;
+            let written = file.write_vectored_at_volatile(&src_slices, off).unwrap();
+            assert_eq!(written, expected.len());
+
+            // Read back into scattered destination pages.
+            let dst_base = pages * stride;
+            let mut dst_slices = Vec::with_capacity(pages);
+            for p in 0..pages {
+                let addr = GuestAddress((dst_base + p * stride) as u64);
+                dst_slices.push(mem.get_slice(addr, page_size).unwrap());
+            }
+            let read = file.read_vectored_at_volatile(&dst_slices, off).unwrap();
+            assert_eq!(read, expected.len());
+
+            let mut actual = vec![0u8; expected.len()];
+            for p in 0..pages {
+                let addr = GuestAddress((dst_base + p * stride) as u64);
+                mem.read_slice(&mut actual[p * page_size..(p + 1) * page_size], addr)
+                    .unwrap();
+            }
+            assert_eq!(actual, expected);
+
+            // EOF at and beyond end-of-file returns Ok(0), not an error.
+            let eof_slice = mem.get_slice(GuestAddress(0), 64).unwrap();
+            assert_eq!(
+                file.read_at_volatile(eof_slice, off + expected.len() as u64)
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                file.read_at_volatile(eof_slice, off + expected.len() as u64 + 4096)
+                    .unwrap(),
+                0
+            );
+
+            // Partial read near EOF.
+            let partial = file
+                .read_at_volatile(eof_slice, off + expected.len() as u64 - 17)
+                .unwrap();
+            assert_eq!(partial, 17);
+
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+
+        #[test]
+        fn positional_write_on_append_handle_preserves_prefix() {
+            let path = temp_path("append");
+            {
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                f.write_all(b"hello ").unwrap();
+            }
+            let file = OpenOptions::new().append(true).open(&path).unwrap();
+            let mem: GuestMemoryMmap<()> =
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+            mem.write_slice(b"world", GuestAddress(0)).unwrap();
+            let slice = mem.get_slice(GuestAddress(0), 5).unwrap();
+            // Supply offset 0 (inside existing prefix): append handle must append, not overwrite.
+            let written = file.write_vectored_at_volatile(&[slice], 0).unwrap();
+            assert_eq!(written, 5);
+            drop(file);
+
+            let mut contents = String::new();
+            std::fs::File::open(&path)
+                .unwrap()
+                .read_to_string(&mut contents)
+                .unwrap();
+            assert_eq!(contents, "hello world");
+            std::fs::remove_file(path).unwrap();
+        }
+
+        #[test]
+        fn rejects_out_of_range_and_windows_sentinel_offsets() {
+            let path = temp_path("offsets");
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mem: GuestMemoryMmap<()> =
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
+            mem.write_slice(b"abcd", GuestAddress(0)).unwrap();
+            let slice = mem.get_slice(GuestAddress(0), 4).unwrap();
+
+            for bad_offset in [u64::MAX, u64::MAX - 1, (i64::MAX as u64) + 1, (i64::MAX as u64) - 2] {
+                let err = file.write_at_volatile(slice, bad_offset).unwrap_err();
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert_eq!(err.raw_os_error(), None);
+                let err = file.read_at_volatile(slice, bad_offset).unwrap_err();
+                assert_eq!(err.kind(), ErrorKind::InvalidInput);
+                assert_eq!(err.raw_os_error(), None);
+            }
+            assert_eq!(file.metadata().unwrap().len(), 0);
+
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+
+        #[test]
+        fn async_overlapped_handle_and_high_offset_word_work() {
+            let path = temp_path("overlapped");
+            let file = std::sync::Arc::new(
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .custom_flags(FILE_FLAG_OVERLAPPED)
+                    .open(&path)
+                    .unwrap(),
+            );
+            let mem: GuestMemoryMmap<()> =
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 8192)]).unwrap();
+            mem.write_slice(b"overlapped-payload", GuestAddress(0))
+                .unwrap();
+
+            let src = mem.get_slice(GuestAddress(0), 18).unwrap();
+            assert_eq!(file.write_at_volatile(src, 128).unwrap(), 18);
+
+            let dst = mem.get_slice(GuestAddress(4096), 18).unwrap();
+            assert_eq!(file.read_at_volatile(dst, 128).unwrap(), 18);
+            let mut buf = [0u8; 18];
+            mem.read_slice(&mut buf, GuestAddress(4096)).unwrap();
+            assert_eq!(&buf, b"overlapped-payload");
+
+            // Reading past EOF on an async handle must also return Ok(0).
+            assert_eq!(file.read_at_volatile(dst, (1u64 << 32) + 64).unwrap(), 0);
+
+            // Concurrent overlapped I/O from distinct threads uses independent per-thread events.
+            let mut handles = Vec::new();
+            for tid in 0..4u64 {
+                let shared = std::sync::Arc::clone(&file);
+                handles.push(std::thread::spawn(move || {
+                    let tmem: GuestMemoryMmap<()> =
+                        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 8192)]).unwrap();
+                    let pattern = [(tid as u8) + 0x41; 64];
+                    tmem.write_slice(&pattern, GuestAddress(0)).unwrap();
+                    let wslice = tmem.get_slice(GuestAddress(0), 64).unwrap();
+                    let rslice = tmem.get_slice(GuestAddress(4096), 64).unwrap();
+                    let base = 4096 + tid * 256;
+                    for _ in 0..32 {
+                        assert_eq!(shared.write_at_volatile(wslice, base).unwrap(), 64);
+                        assert_eq!(shared.read_at_volatile(rslice, base).unwrap(), 64);
+                        let mut got = [0u8; 64];
+                        tmem.read_slice(&mut got, GuestAddress(4096)).unwrap();
+                        assert_eq!(got, pattern);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}
+
 #[cfg(feature = "blk")]
 impl FileReadWriteAtVolatile for DiskProperties {
     fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> Result<usize> {

@@ -20,7 +20,6 @@ pub mod block;
 pub mod console;
 pub mod descriptor_utils;
 pub mod device;
-#[cfg(any(not(target_os = "windows"), feature = "blk"))]
 pub mod file_traits;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
